@@ -1,0 +1,12 @@
+[
+  {
+    "role": "user",
+    "content": "I'm a tenant in San Francisco and my landlord is trying to raise my rent by 10%. Is this legal?",
+    "timestamp": "2025-04-22T13:35:26.619719"
+  },
+  {
+    "role": "assistant",
+    "content": "I am not your lawyer and this is not legal advice. If you need tailored guidance, consult a licensed California attorney.\n\nThank you for reaching out about your rent increase situation. To better assist you, could you please tell me when your current lease started and if you've received any formal notice about the rent increase? For example, was the notice in writing, and does it specify when the new rent would take effect?",
+    "timestamp": "2025-04-22T13:35:26.619719"
+  }
+]

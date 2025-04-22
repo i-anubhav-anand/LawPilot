@@ -1,0 +1,539 @@
+{
+	"info": {
+		"_postman_id": "d9e5a6b8-f3c7-4a8e-a5a7-1f2bd3c45e6f",
+		"name": "Legal AI Assistant API",
+		"description": "API collection for the Legal AI Assistant - a RAG-based system for tenant-landlord law.",
+		"schema": "https://schema.getpostman.com/json/collection/v2.1.0/collection.json"
+	},
+	"item": [
+		{
+			"name": "Health Checks",
+			"item": [
+				{
+					"name": "Root",
+					"request": {
+						"method": "GET",
+						"header": [],
+						"url": {
+							"raw": "{{base_url}}/",
+							"host": [
+								"{{base_url}}"
+							],
+							"path": [
+								""
+							]
+						},
+						"description": "Check if the API server is running."
+					},
+					"response": []
+				},
+				{
+					"name": "Health Check",
+					"request": {
+						"method": "GET",
+						"header": [],
+						"url": {
+							"raw": "{{base_url}}/health",
+							"host": [
+								"{{base_url}}"
+							],
+							"path": [
+								"health"
+							]
+						},
+						"description": "Check if the API server is healthy. This is a lightweight endpoint that always responds quickly, even during heavy processing."
+					},
+					"response": []
+				},
+				{
+					"name": "Server Status",
+					"request": {
+						"method": "GET",
+						"header": [],
+						"url": {
+							"raw": "{{base_url}}/status",
+							"host": [
+								"{{base_url}}"
+							],
+							"path": [
+								"status"
+							]
+						},
+						"description": "Get detailed server status information including CPU usage, memory status, number of workers, and uptime."
+					},
+					"response": []
+				},
+				{
+					"name": "Get Logs",
+					"request": {
+						"method": "GET",
+						"header": [],
+						"url": {
+							"raw": "{{base_url}}/logs?lines=100&component=document_processor",
+							"host": [
+								"{{base_url}}"
+							],
+							"path": [
+								"logs"
+							],
+							"query": [
+								{
+									"key": "lines",
+									"value": "100",
+									"description": "Number of log lines to retrieve"
+								},
+								{
+									"key": "component",
+									"value": "document_processor",
+									"description": "Filter by component name (e.g., document_processor, vector_store, text_chunker)"
+								}
+							]
+						},
+						"description": "Get application logs, optionally filtered by component."
+					},
+					"response": []
+				}
+			],
+			"description": "Basic health check endpoints to verify the API is running."
+		},
+		{
+			"name": "Chat",
+			"item": [
+				{
+					"name": "Send Chat Message",
+					"request": {
+						"method": "POST",
+						"header": [
+							{
+								"key": "Content-Type",
+								"value": "application/json"
+							}
+						],
+						"body": {
+							"mode": "raw",
+							"raw": "{\n    \"message\": \"I'm a tenant in San Francisco and my landlord is trying to raise my rent by 10%. Is this legal?\",\n    \"session_id\": \"{{session_id}}\",\n    \"case_file_id\": \"{{case_file_id}}\"\n}"
+						},
+						"url": {
+							"raw": "{{base_url}}/api/chat/",
+							"host": [
+								"{{base_url}}"
+							],
+							"path": [
+								"api",
+								"chat",
+								""
+							]
+						},
+						"description": "Send a message to the legal assistant and get a response."
+					},
+					"response": []
+				},
+				{
+					"name": "Get Chat History",
+					"request": {
+						"method": "GET",
+						"header": [],
+						"url": {
+							"raw": "{{base_url}}/api/chat/history/{{session_id}}",
+							"host": [
+								"{{base_url}}"
+							],
+							"path": [
+								"api",
+								"chat",
+								"history",
+								"{{session_id}}"
+							]
+						},
+						"description": "Get the chat history for a specific session."
+					},
+					"response": []
+				},
+				{
+					"name": "List Chat Sessions",
+					"request": {
+						"method": "GET",
+						"header": [],
+						"url": {
+							"raw": "{{base_url}}/api/chat/sessions",
+							"host": [
+								"{{base_url}}"
+							],
+							"path": [
+								"api",
+								"chat",
+								"sessions"
+							]
+						},
+						"description": "Get a list of all available chat sessions."
+					},
+					"response": []
+				}
+			],
+			"description": "Endpoints for interacting with the legal assistant chat."
+		},
+		{
+			"name": "Documents",
+			"item": [
+				{
+					"name": "List All Documents",
+					"request": {
+						"method": "GET",
+						"header": [],
+						"url": {
+							"raw": "{{base_url}}/api/documents/",
+							"host": [
+								"{{base_url}}"
+							],
+							"path": [
+								"api",
+								"documents",
+								""
+							],
+							"query": [
+								{
+									"key": "session_id",
+									"value": "{{session_id}}",
+									"description": "Optional - filter by session ID",
+									"disabled": true
+								}
+							]
+						},
+						"description": "List all documents and their processing status."
+					},
+					"response": []
+				},
+				{
+					"name": "List Global Documents",
+					"request": {
+						"method": "GET",
+						"header": [],
+						"url": {
+							"raw": "{{base_url}}/api/documents/global",
+							"host": [
+								"{{base_url}}"
+							],
+							"path": [
+								"api",
+								"documents",
+								"global"
+							]
+						},
+						"description": "List all global documents (available to all sessions)."
+					},
+					"response": []
+				},
+				{
+					"name": "Upload Document",
+					"request": {
+						"method": "POST",
+						"header": [],
+						"body": {
+							"mode": "formdata",
+							"formdata": [
+								{
+									"key": "file",
+									"type": "file",
+									"src": "/path/to/your/document.pdf"
+								},
+								{
+									"key": "session_id",
+									"value": "{{session_id}}",
+									"type": "text"
+								},
+								{
+									"key": "case_file_id",
+									"value": "{{case_file_id}}",
+									"type": "text"
+								}
+							]
+						},
+						"url": {
+							"raw": "{{base_url}}/api/documents/upload",
+							"host": [
+								"{{base_url}}"
+							],
+							"path": [
+								"api",
+								"documents",
+								"upload"
+							]
+						},
+						"description": "Upload a document for processing and analysis. Supported formats: PDF, DOCX, TXT, JPG, PNG."
+					},
+					"response": []
+				},
+				{
+					"name": "Upload Global Document",
+					"request": {
+						"method": "POST",
+						"header": [],
+						"body": {
+							"mode": "formdata",
+							"formdata": [
+								{
+									"key": "file",
+									"type": "file",
+									"src": "/path/to/your/global_document.pdf"
+								}
+							]
+						},
+						"url": {
+							"raw": "{{base_url}}/api/documents/upload/global",
+							"host": [
+								"{{base_url}}"
+							],
+							"path": [
+								"api",
+								"documents",
+								"upload",
+								"global"
+							]
+						},
+						"description": "Upload a document to the global knowledge base that will be available to all sessions. Supported formats: PDF, DOCX, TXT, JPG, PNG."
+					},
+					"response": []
+				},
+				{
+					"name": "Get Document Status",
+					"request": {
+						"method": "GET",
+						"header": [],
+						"url": {
+							"raw": "{{base_url}}/api/documents/{{document_id}}",
+							"host": [
+								"{{base_url}}"
+							],
+							"path": [
+								"api",
+								"documents",
+								"{{document_id}}"
+							]
+						},
+						"description": "Get the status of a document processing job."
+					},
+					"response": []
+				},
+				{
+					"name": "Get Document Processing Status",
+					"request": {
+						"method": "GET",
+						"header": [],
+						"url": {
+							"raw": "{{base_url}}/api/documents/processing-status",
+							"host": [
+								"{{base_url}}"
+							],
+							"path": [
+								"api",
+								"documents",
+								"processing-status"
+							]
+						},
+						"description": "Get detailed statistics about document processing, including counts of documents in different statuses, vector store stats, and recently processed documents."
+					},
+					"response": []
+				},
+				{
+					"name": "Analyze Document",
+					"request": {
+						"method": "POST",
+						"header": [],
+						"url": {
+							"raw": "{{base_url}}/api/documents/{{document_id}}/analyze",
+							"host": [
+								"{{base_url}}"
+							],
+							"path": [
+								"api",
+								"documents",
+								"{{document_id}}",
+								"analyze"
+							]
+						},
+						"description": "Analyze a document for legal issues after it has been processed."
+					},
+					"response": []
+				}
+			],
+			"description": "Endpoints for managing and analyzing documents."
+		},
+		{
+			"name": "Case Files",
+			"item": [
+				{
+					"name": "Create Case File",
+					"request": {
+						"method": "POST",
+						"header": [
+							{
+								"key": "Content-Type",
+								"value": "application/json"
+							}
+						],
+						"body": {
+							"mode": "raw",
+							"raw": "{\n    \"title\": \"Tenant Rent Increase Issue\",\n    \"description\": \"Case regarding a potential illegal rent increase in San Francisco\",\n    \"session_id\": \"{{session_id}}\"\n}"
+						},
+						"url": {
+							"raw": "{{base_url}}/api/case-files/",
+							"host": [
+								"{{base_url}}"
+							],
+							"path": [
+								"api",
+								"case-files",
+								""
+							]
+						},
+						"description": "Create a new case file to track facts about a legal issue."
+					},
+					"response": []
+				},
+				{
+					"name": "Get Case File",
+					"request": {
+						"method": "GET",
+						"header": [],
+						"url": {
+							"raw": "{{base_url}}/api/case-files/{{case_file_id}}",
+							"host": [
+								"{{base_url}}"
+							],
+							"path": [
+								"api",
+								"case-files",
+								"{{case_file_id}}"
+							]
+						},
+						"description": "Get a case file by ID."
+					},
+					"response": []
+				},
+				{
+					"name": "Update Case File",
+					"request": {
+						"method": "PUT",
+						"header": [
+							{
+								"key": "Content-Type",
+								"value": "application/json"
+							}
+						],
+						"body": {
+							"mode": "raw",
+							"raw": "{\n    \"facts\": {\n        \"lease_terms\": {\n            \"monthly_rent\": 2500,\n            \"lease_start_date\": \"2021-01-01\"\n        },\n        \"key_dates\": {\n            \"notice_received\": \"2023-05-15\"\n        },\n        \"special_concerns\": [\"possible retaliation\", \"no proper notice\"]\n    }\n}"
+						},
+						"url": {
+							"raw": "{{base_url}}/api/case-files/{{case_file_id}}",
+							"host": [
+								"{{base_url}}"
+							],
+							"path": [
+								"api",
+								"case-files",
+								"{{case_file_id}}"
+							]
+						},
+						"description": "Update a case file with new facts."
+					},
+					"response": []
+				},
+				{
+					"name": "List Case Files",
+					"request": {
+						"method": "GET",
+						"header": [],
+						"url": {
+							"raw": "{{base_url}}/api/case-files/?session_id={{session_id}}",
+							"host": [
+								"{{base_url}}"
+							],
+							"path": [
+								"api",
+								"case-files",
+								""
+							],
+							"query": [
+								{
+									"key": "session_id",
+									"value": "{{session_id}}",
+									"description": "Optional - filter by session ID"
+								}
+							]
+						},
+						"description": "List all case files, optionally filtered by session ID."
+					},
+					"response": []
+				},
+				{
+					"name": "Delete Case File",
+					"request": {
+						"method": "DELETE",
+						"header": [],
+						"url": {
+							"raw": "{{base_url}}/api/case-files/{{case_file_id}}",
+							"host": [
+								"{{base_url}}"
+							],
+							"path": [
+								"api",
+								"case-files",
+								"{{case_file_id}}"
+							]
+						},
+						"description": "Delete a case file."
+					},
+					"response": []
+				}
+			],
+			"description": "Endpoints for managing case files."
+		}
+	],
+	"event": [
+		{
+			"listen": "prerequest",
+			"script": {
+				"type": "text/javascript",
+				"exec": [
+					""
+				]
+			}
+		},
+		{
+			"listen": "test",
+			"script": {
+				"type": "text/javascript",
+				"exec": [
+					""
+				]
+			}
+		}
+	],
+	"variable": [
+		{
+			"key": "base_url",
+			"value": "http://localhost:8000",
+			"type": "string",
+			"description": "Base URL for the API"
+		},
+		{
+			"key": "session_id",
+			"value": "",
+			"type": "string",
+			"description": "Session ID for chat history"
+		},
+		{
+			"key": "case_file_id",
+			"value": "",
+			"type": "string",
+			"description": "Case file ID"
+		},
+		{
+			"key": "document_id",
+			"value": "",
+			"type": "string",
+			"description": "Document ID"
+		}
+	]
+} 

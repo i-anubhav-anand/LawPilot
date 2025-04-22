@@ -1,0 +1,12 @@
+[
+  {
+    "role": "user",
+    "content": "I'm a tenant in San Francisco and my landlord is trying to raise my rent by 10%. Is this legal?",
+    "timestamp": "2025-04-22T13:29:00.087827"
+  },
+  {
+    "role": "assistant",
+    "content": "I apologize, but I encountered an error while processing your request: Error code: 401 - {'error': {'message': 'Incorrect API key provided: 8VsO4Xqv*****************************************************************************************************************mzBN. You can find your API key at https://platform.openai.com/account/api-keys.', 'type': 'invalid_request_error', 'param': None, 'code': 'invalid_api_key'}}. Please try again or contact support if the issue persists.",
+    "timestamp": "2025-04-22T13:29:00.087827"
+  }
+]
