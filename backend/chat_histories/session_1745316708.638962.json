@@ -1,0 +1,12 @@
+[
+  {
+    "role": "user",
+    "content": "I am a tenant in San Francisco with a question about rent increases",
+    "timestamp": "2025-04-22T15:40:44.038603"
+  },
+  {
+    "role": "assistant",
+    "content": "I am not your lawyer and this is not legal advice. If you need tailored guidance, consult a licensed California attorney.\n\nI understand you have a question about rent increases. To help you better, could you please tell me if you've recently received a notice about a rent increase, and if so, what the percentage of the increase is? For example, was it a 5% increase or perhaps something higher?",
+    "timestamp": "2025-04-22T15:40:44.038603"
+  }
+]

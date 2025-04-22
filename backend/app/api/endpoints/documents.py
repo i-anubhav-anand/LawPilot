@@ -261,4 +261,63 @@ async def list_global_documents():
     global_docs = [doc for doc in all_docs if getattr(doc, "is_global", False)]
     
     logger.info(f"✅ RETURNED {len(global_docs)} GLOBAL DOCUMENTS")
-    return global_docs 
+    return global_docs
+
+@router.post("/{document_id}/toggle-global", response_model=DocumentResponse)
+async def toggle_document_global_status(
+    document_id: str
+):
+    """
+    Toggle a document's global status (make it available to all sessions or restrict it).
+    This allows changing a document's global flag without reprocessing it.
+    """
+    logger.info(f"🔄 TOGGLING DOCUMENT GLOBAL STATUS: id={document_id}")
+    
+    # Check if document exists
+    document = document_processor.get_document(document_id)
+    if not document:
+        logger.warning(f"❌ DOCUMENT NOT FOUND: id={document_id}")
+        raise HTTPException(status_code=404, detail="Document not found")
+    
+    # Check if document is processed
+    if document.status != "processed":
+        logger.warning(f"❌ DOCUMENT NOT READY: id={document_id}, status={document.status}")
+        raise HTTPException(status_code=400, detail="Document is not in 'processed' state")
+    
+    try:
+        # Toggle the global flag
+        new_global_status = not document.is_global
+        
+        # Update in document store
+        updated_document = DocumentResponse(
+            document_id=document.document_id,
+            filename=document.filename,
+            session_id=document.session_id,
+            case_file_id=document.case_file_id,
+            status=document.status,
+            created_at=document.created_at,
+            processed_at=document.processed_at,
+            is_global=new_global_status
+        )
+        document_processor.document_store[document_id] = updated_document
+        
+        # Save the updated metadata to disk
+        document_processor._save_document_metadata(document_id)
+        
+        # Update in vector store metadata
+        vector_document = await document_processor.vector_store.get_document(document_id)
+        if vector_document:
+            # Update the metadata in the vector store
+            vector_document["metadata"]["is_global"] = new_global_status
+            
+            # Save the updated metadata
+            await document_processor.vector_store._save_data()
+            
+            logger.info(f"✅ DOCUMENT GLOBAL STATUS UPDATED: id={document_id}, is_global={new_global_status}")
+        else:
+            logger.warning(f"⚠️ DOCUMENT NOT FOUND IN VECTOR STORE: id={document_id}")
+        
+        return updated_document
+    except Exception as e:
+        logger.error(f"❌ ERROR UPDATING DOCUMENT GLOBAL STATUS: id={document_id}, error={str(e)}")
+        raise HTTPException(status_code=500, detail=f"Error updating document global status: {str(e)}") 

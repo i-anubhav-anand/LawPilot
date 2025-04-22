@@ -48,7 +48,7 @@ class EmbeddingProgressReporter:
 class DocumentProcessor:
     def __init__(self):
         """Initialize the document processor."""
-        self.document_store = {}  # In-memory store, replace with database in production
+        self.document_store = {}  # In-memory store, will be persisted to disk
         self.vector_store = VectorStore()
         # Use smaller chunk size by default to avoid getting stuck
         self.text_chunker = TextChunker(chunk_size=300, chunk_overlap=50, max_chunk_time=60)
@@ -59,7 +59,66 @@ class DocumentProcessor:
         # Create necessary directories
         os.makedirs("uploads", exist_ok=True)
         os.makedirs("processed", exist_ok=True)
-        logger.info("🚀 Document processor initialized. Uploads and processed directories created.")
+        os.makedirs("documents_metadata", exist_ok=True)  # New directory for document metadata persistence
+        logger.info("🚀 Document processor initialized. Directories created.")
+        
+        # Load document metadata from disk
+        self._load_document_metadata()
+        
+    def _load_document_metadata(self):
+        """Load document metadata from disk."""
+        metadata_dir = Path("documents_metadata")
+        if not metadata_dir.exists():
+            return
+            
+        logger.info("🔄 LOADING DOCUMENT METADATA FROM DISK")
+        count = 0
+        
+        for metadata_file in metadata_dir.glob("*.json"):
+            try:
+                with open(metadata_file, "r") as f:
+                    doc_data = json.load(f)
+                    
+                # Convert string dates back to datetime objects
+                if "created_at" in doc_data and doc_data["created_at"]:
+                    doc_data["created_at"] = datetime.fromisoformat(doc_data["created_at"])
+                if "processed_at" in doc_data and doc_data["processed_at"]:
+                    doc_data["processed_at"] = datetime.fromisoformat(doc_data["processed_at"])
+                    
+                # Create DocumentResponse object and add to document store
+                doc_response = DocumentResponse(**doc_data)
+                self.document_store[doc_response.document_id] = doc_response
+                count += 1
+            except Exception as e:
+                logger.error(f"❌ ERROR LOADING DOCUMENT METADATA: file={metadata_file}, error={str(e)}")
+                
+        logger.info(f"✅ LOADED {count} DOCUMENT METADATA RECORDS FROM DISK")
+        
+    def _save_document_metadata(self, document_id: str):
+        """Save document metadata to disk."""
+        document = self.document_store.get(document_id)
+        if not document:
+            return
+            
+        metadata_path = Path("documents_metadata") / f"{document_id}.json"
+        
+        try:
+            # Convert document to dict
+            doc_dict = document.dict()
+            
+            # Convert datetime objects to strings
+            if doc_dict["created_at"]:
+                doc_dict["created_at"] = doc_dict["created_at"].isoformat()
+            if doc_dict["processed_at"]:
+                doc_dict["processed_at"] = doc_dict["processed_at"].isoformat()
+                
+            # Save to file
+            with open(metadata_path, "w") as f:
+                json.dump(doc_dict, f, indent=2)
+                
+            logger.info(f"✅ DOCUMENT METADATA SAVED: id={document_id}")
+        except Exception as e:
+            logger.error(f"❌ ERROR SAVING DOCUMENT METADATA: id={document_id}, error={str(e)}")
         
     def get_document(self, document_id: str) -> Optional[DocumentResponse]:
         """
@@ -104,6 +163,9 @@ class DocumentProcessor:
                 status="processing",
                 is_global=is_global
             )
+            
+            # Save initial metadata
+            self._save_document_metadata(document_id)
             
             logger.info(f"🔄 STARTED PROCESSING DOCUMENT: id={document_id}, file={Path(file_path).name}, global={is_global}")
             
@@ -300,8 +362,12 @@ class DocumentProcessor:
                 case_file_id=case_file_id,
                 status="processed",
                 created_at=self.document_store[document_id].created_at,
-                processed_at=datetime.now()
+                processed_at=datetime.now(),
+                is_global=is_global
             )
+            
+            # Save updated metadata
+            self._save_document_metadata(document_id)
             
             total_processing_time = time.time() - start_time
             logger.info(f"✅ DOCUMENT PROCESSING COMPLETED: id={document_id}, total_time={total_processing_time:.2f}s")
@@ -333,6 +399,8 @@ class DocumentProcessor:
                 created_at=self.document_store[document_id].created_at,
                 error=f"Processing timed out: {str(e)}"
             )
+            # Save error metadata
+            self._save_document_metadata(document_id)
         except Exception as e:
             logger.error(f"❌ ERROR PROCESSING DOCUMENT: id={document_id}, error={str(e)}", exc_info=True)
             # Update document with error
@@ -345,6 +413,8 @@ class DocumentProcessor:
                 created_at=self.document_store[document_id].created_at,
                 error=str(e)
             )
+            # Save error metadata
+            self._save_document_metadata(document_id)
     
     def _extract_text(self, file_path: str) -> str:
         """

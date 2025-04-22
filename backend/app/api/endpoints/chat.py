@@ -11,7 +11,7 @@ from app.schemas.case_file import CaseFile
 router = APIRouter()
 logger = logging.getLogger(__name__)
 
-@router.post("/chat", response_model=ChatResponse)
+@router.post("/", response_model=ChatResponse)
 async def process_chat(
     chat_request: ChatRequest,
     rag_engine: RAGEngine = Depends(get_rag_engine),
@@ -34,19 +34,30 @@ async def process_chat(
 
     try:
         # Process the query
-        response = await rag_engine.process_query(
+        rag_response = await rag_engine.process_query(
             query=chat_request.query,
             session_id=chat_request.session_id,
             case_file=case_file,
             num_results=chat_request.num_results if chat_request.num_results else 5
         )
         logger.info(f"✅ CHAT PROCESSING COMPLETED: session_id={chat_request.session_id}")
-        return response
+        
+        # Transform RAGResponse to ChatResponse
+        chat_response = ChatResponse(
+            message=rag_response.answer,
+            session_id=chat_request.session_id,
+            case_file_id=chat_request.case_file_id,
+            sources=rag_response.sources,
+            next_questions=rag_response.suggested_questions
+        )
+        
+        return chat_response
     except Exception as e:
         logger.error(f"❌ ERROR PROCESSING CHAT: session_id={chat_request.session_id}, error={str(e)}")
         raise HTTPException(status_code=500, detail=f"Error processing chat: {str(e)}")
 
-@router.get("/chat/sessions", response_model=ChatSessionList)
+@router.get("/sessions", response_model=ChatSessionList)
+@router.get("/sessions/", response_model=ChatSessionList)  # Add endpoint with trailing slash too
 async def list_chat_sessions(
     rag_engine: RAGEngine = Depends(get_rag_engine)
 ):
@@ -61,7 +72,32 @@ async def list_chat_sessions(
     logger.info(f"✅ CHAT SESSIONS LISTED: count={len(sessions)}")
     return ChatSessionList(sessions=sessions)
 
-@router.get("/chat/{session_id}/history", response_model=List[Dict])
+@router.get("/session/{session_id}", response_model=ChatSession)
+@router.get("/session/{session_id}/", response_model=ChatSession)
+async def get_chat_session(
+    session_id: str,
+    rag_engine: RAGEngine = Depends(get_rag_engine)
+):
+    """
+    Get details for a specific chat session.
+    """
+    logger.info(f"🔄 RETRIEVING CHAT SESSION: session_id={session_id}")
+    
+    if session_id not in rag_engine.chat_histories:
+        logger.warning(f"⚠️ CHAT SESSION NOT FOUND: session_id={session_id}")
+        raise HTTPException(status_code=404, detail="Chat session not found")
+    
+    history = rag_engine.chat_histories[session_id]
+    session = ChatSession(
+        session_id=session_id,
+        message_count=len(history)
+    )
+    
+    logger.info(f"✅ CHAT SESSION RETRIEVED: session_id={session_id}, message_count={len(history)}")
+    return session
+
+@router.get("/{session_id}/history", response_model=List[Dict])
+@router.get("/{session_id}/history/", response_model=List[Dict])  # Add endpoint with trailing slash too
 async def get_chat_history(
     session_id: str,
     rag_engine: RAGEngine = Depends(get_rag_engine)
