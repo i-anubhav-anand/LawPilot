@@ -320,6 +320,7 @@ class VectorStore:
             results = []
             filtered_count = 0
             metadata_filtered_count = 0
+            missing_chunk_count = 0
             
             logger.info(f"🔄 PROCESSING {len(indices)} SEARCH RESULTS")
             
@@ -338,6 +339,13 @@ class VectorStore:
                 
                 # Skip if document doesn't exist (possibly deleted)
                 if doc_id not in self.document_store:
+                    logger.debug(f"⚠️ DOCUMENT NOT FOUND IN STORE: id={doc_id}")
+                    continue
+                
+                # Skip if chunk doesn't exist in the document
+                if chunk_id not in self.document_store[doc_id]["chunks"]:
+                    logger.debug(f"⚠️ CHUNK NOT FOUND IN DOCUMENT: doc_id={doc_id}, chunk_id={chunk_id}")
+                    missing_chunk_count += 1
                     continue
                     
                 # Apply metadata filter if specified
@@ -351,20 +359,26 @@ class VectorStore:
                     if not metadata_match:
                         metadata_filtered_count += 1
                         continue
-                        
-                # Get chunk text and metadata
-                chunk_text = self.document_store[doc_id]["chunks"][chunk_id]["text"]
-                doc_metadata = self.document_store[doc_id]["metadata"]
                 
-                # Add to results
-                results.append({
-                    "document_id": doc_id,
-                    "chunk_id": chunk_id,
-                    "text": chunk_text,
-                    "metadata": doc_metadata,
-                    "similarity": similarity,
-                    "distance": float(distance)  # Convert from numpy to Python float
-                })
+                try:        
+                    # Get chunk text and metadata
+                    chunk_text = self.document_store[doc_id]["chunks"][chunk_id]["text"]
+                    doc_metadata = self.document_store[doc_id]["metadata"]
+                    
+                    # Add to results
+                    results.append({
+                        "document_id": doc_id,
+                        "chunk_id": chunk_id,
+                        "text": chunk_text,
+                        "metadata": doc_metadata,
+                        "similarity": similarity,
+                        "distance": float(distance)  # Convert from numpy to Python float
+                    })
+                except KeyError as e:
+                    # Handle case where chunk data is malformed
+                    logger.error(f"❌ SEARCH ERROR: Invalid chunk data - doc_id={doc_id}, chunk_id={chunk_id}, error={str(e)}")
+                    missing_chunk_count += 1
+                    continue
                 
                 # Stop once we have enough results
                 if len(results) >= limit:
@@ -378,6 +392,7 @@ class VectorStore:
                 f"✅ SEARCH COMPLETED: found={len(results)} results, "
                 f"filtered_by_threshold={filtered_count}, "
                 f"filtered_by_metadata={metadata_filtered_count}, "
+                f"missing_chunks={missing_chunk_count}, "
                 f"time={search_time:.2f}s"
             )
             

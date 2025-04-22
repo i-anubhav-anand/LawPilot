@@ -100,6 +100,35 @@
 			"name": "Chat",
 			"item": [
 				{
+					"name": "Create Chat Session",
+					"request": {
+						"method": "POST",
+						"header": [
+							{
+								"key": "Content-Type",
+								"value": "application/json"
+							}
+						],
+						"body": {
+							"mode": "raw",
+							"raw": "{\n    \"case_file_id\": \"{{case_file_id}}\"\n}"
+						},
+						"url": {
+							"raw": "{{base_url}}/api/chat/create-session",
+							"host": [
+								"{{base_url}}"
+							],
+							"path": [
+								"api",
+								"chat",
+								"create-session"
+							]
+						},
+						"description": "Create a new chat session and get a session ID to use for subsequent chat messages."
+					},
+					"response": []
+				},
+				{
 					"name": "Send Chat Message",
 					"request": {
 						"method": "POST",
@@ -111,7 +140,7 @@
 						],
 						"body": {
 							"mode": "raw",
-							"raw": "{\n    \"message\": \"I'm a tenant in San Francisco and my landlord is trying to raise my rent by 10%. Is this legal?\",\n    \"session_id\": \"{{session_id}}\",\n    \"case_file_id\": \"{{case_file_id}}\"\n}"
+							"raw": "{\n    \"query\": \"I'm a tenant in San Francisco and my landlord is trying to raise my rent by 10%. Is this legal?\",\n    \"session_id\": \"{{session_id}}\",\n    \"case_file_id\": \"{{case_file_id}}\"\n}"
 						},
 						"url": {
 							"raw": "{{base_url}}/api/chat/",

@@ -38,4 +38,24 @@ ENV/
 
 # Logs
 *.log
-logs/ 
+logs/
+
+# Project specific
+backend/uploads/
+backend/processed/
+backend/vector_db/
+backend/chat_histories/
+backend/documents_metadata/
+backend/conversation_states/
+backend/direct_text_cache/
+
+# Frontend
+frontend/node_modules/
+frontend/.next/
+frontend/out/
+frontend/.cache/
+frontend/coverage/
+frontend/npm-debug.log*
+frontend/yarn-debug.log*
+frontend/yarn-error.log*
+frontend/.pnpm-debug.log* 

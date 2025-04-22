@@ -7,14 +7,18 @@ from datetime import datetime
 import asyncio
 import logging
 import uuid
+import re
 
 from app.core.vector_store import VectorStore
 from app.core.text_chunker import TextChunker
 from app.models.chat import ChatMessage, RAGResponse, Source
 from app.models.case_file import CaseFile
-from app.models.documents import DocumentAnalysis
+from app.models.documents import DocumentResponse, DocumentAnalysis
 from app.core.system_prompt import get_system_prompt
 from app.core.conversation_state import ConversationState
+from app.core.direct_processor import DirectTextProcessor
+from app.core.document_processor import DocumentProcessor
+from app.core.llm_service import OpenAIService
 
 logger = logging.getLogger(__name__)
 
@@ -25,6 +29,9 @@ class RAGEngine:
         self.text_chunker = TextChunker()
         self.chat_histories = {}  # Session ID -> List[ChatMessage]
         self.conversation_states = {}  # Session ID -> ConversationState
+        
+        # Initialize basic LLM service for API calls
+        self.llm_service = OpenAIService()
         
         # Create directories for storing data
         os.makedirs("legal_corpus", exist_ok=True)
@@ -302,6 +309,11 @@ class RAGEngine:
                 limit=global_limit,
                 filter_metadata={"is_global": True}
             )
+            # Validate results to make sure all needed fields are present
+            global_results = [
+                r for r in global_results 
+                if "document_id" in r and "chunk_id" in r and "text" in r and "metadata" in r
+            ]
             logger.info(f"✅ FOUND {len(global_results)} RELEVANT GLOBAL CHUNKS")
         except Exception as e:
             logger.error(f"❌ ERROR SEARCHING GLOBAL DOCUMENTS: {str(e)}")
@@ -318,6 +330,11 @@ class RAGEngine:
                 limit=session_limit,
                 filter_metadata={"session_id": session_id, "is_global": False}
             )
+            # Validate results to make sure all needed fields are present
+            session_results = [
+                r for r in session_results 
+                if "document_id" in r and "chunk_id" in r and "text" in r and "metadata" in r
+            ]
             logger.info(f"✅ FOUND {len(session_results)} RELEVANT SESSION CHUNKS")
         except Exception as e:
             logger.error(f"❌ ERROR SEARCHING SESSION DOCUMENTS: {str(e)}")
@@ -332,20 +349,30 @@ class RAGEngine:
         case_file_results = []
         if case_file and case_file.documents:
             logger.info(f"🔄 SEARCHING CASE FILE DOCUMENTS: case_file_id={case_file.case_file_id}, docs={len(case_file.documents)}")
+            
+            # Only try to search through valid documents
+            valid_doc_ids = []
             for doc_id in case_file.documents:
-                # Get the document first
-                document = await self.vector_store.get_document(doc_id)
-                if not document:
-                    logger.warning(f"⚠️ CASE FILE DOCUMENT NOT FOUND: doc_id={doc_id}")
-                    continue
-                
-                # Check if document has chunks
-                doc_chunks = document.get("chunks", [])
-                if not doc_chunks:
-                    logger.warning(f"⚠️ CASE FILE DOCUMENT HAS NO CHUNKS: doc_id={doc_id}")
-                    continue
+                try:
+                    # Get the document first
+                    document = await self.vector_store.get_document(doc_id)
+                    if not document:
+                        logger.warning(f"⚠️ CASE FILE DOCUMENT NOT FOUND: doc_id={doc_id}")
+                        continue
                     
-                logger.info(f"🔄 SEARCHING IN DOCUMENT: doc_id={doc_id}, chunks={len(doc_chunks)}")
+                    # Check if document has chunks
+                    doc_chunks = document.get("chunks", [])
+                    if not doc_chunks:
+                        logger.warning(f"⚠️ CASE FILE DOCUMENT HAS NO CHUNKS: doc_id={doc_id}")
+                        continue
+                        
+                    valid_doc_ids.append(doc_id)
+                except Exception as e:
+                    logger.error(f"❌ ERROR CHECKING DOCUMENT {doc_id}: {str(e)}")
+            
+            # Only continue with valid documents
+            for doc_id in valid_doc_ids:
+                logger.info(f"🔄 SEARCHING IN DOCUMENT: doc_id={doc_id}")
                 
                 # Get results from the existing results for this document
                 existing_doc_results = [r for r in results if r.get("document_id") == doc_id]
@@ -359,6 +386,12 @@ class RAGEngine:
                             limit=3,  # Just a few more results
                             filter_metadata={"document_id": doc_id}
                         )
+                        
+                        # Validate results to make sure all needed fields are present
+                        additional_results = [
+                            r for r in additional_results 
+                            if "document_id" in r and "chunk_id" in r and "text" in r and "metadata" in r
+                        ]
                         
                         # Add to case file results
                         for result in additional_results:
@@ -376,16 +409,157 @@ class RAGEngine:
         unique_results = []
         seen_chunks = set()
         for result in results:
-            chunk_key = f"{result.get('document_id')}:{result.get('chunk_id')}"
-            if chunk_key not in seen_chunks:
-                unique_results.append(result)
-                seen_chunks.add(chunk_key)
+            try:
+                chunk_key = f"{result.get('document_id')}:{result.get('chunk_id')}"
+                if chunk_key not in seen_chunks:
+                    unique_results.append(result)
+                    seen_chunks.add(chunk_key)
+            except Exception as e:
+                logger.error(f"❌ ERROR PROCESSING RESULT: {str(e)}")
+                continue
         
         # Sort by similarity and limit to num_results
-        unique_results = sorted(unique_results, key=lambda x: x.get("similarity", 0), reverse=True)[:num_results]
+        try:
+            # Make sure we have the similarity key
+            for result in unique_results:
+                if "similarity" not in result:
+                    result["similarity"] = 0.0
+                    
+            unique_results = sorted(unique_results, key=lambda x: x.get("similarity", 0), reverse=True)[:num_results]
+        except Exception as e:
+            logger.error(f"❌ ERROR SORTING RESULTS: {str(e)}")
+            # Fallback - just take the first few
+            unique_results = unique_results[:num_results] if len(unique_results) > num_results else unique_results
+            
         logger.info(f"✅ FINAL CHUNKS RETRIEVED: global={len(global_results)}, session={len(session_results)}, case_file={len(case_file_results)}, total={len(unique_results)}")
         
         return unique_results
+    
+    async def process_query_with_direct_text(
+        self,
+        query: str,
+        text: str,
+        document_name: str,
+        session_id: str,
+        case_file: Optional[CaseFile] = None,
+        num_results: int = 5
+    ) -> RAGResponse:
+        """
+        Process a user query using the direct text approach (no vector embedding).
+        This allows for immediate responses without waiting for document indexing.
+        
+        Args:
+            query: The user's query.
+            text: The direct text to use for context.
+            document_name: Name of the document or text source.
+            session_id: The session ID.
+            case_file: Optional case file with context.
+            num_results: Number of results to retrieve.
+            
+        Returns:
+            Generated response with sources and suggested questions.
+        """
+        logger.info(f"🔄 PROCESSING QUERY WITH DIRECT TEXT: session_id={session_id}, query='{query}'")
+        
+        # Get or create conversation state
+        conversation_state = self._get_conversation_state(session_id)
+        
+        # Add user message to history
+        if session_id not in self.chat_histories:
+            self.chat_histories[session_id] = []
+        
+        self.chat_histories[session_id].append(ChatMessage(
+            role="user",
+            content=query
+        ))
+        logger.info(f"✅ USER MESSAGE ADDED TO HISTORY: session_id={session_id}")
+        
+        # Process the text directly
+        direct_processor = DirectTextProcessor()
+        direct_result = await direct_processor.process_text(
+            text=text,
+            document_name=document_name,
+            query=query,
+            session_id=session_id,
+            case_file_id=case_file.case_file_id if case_file else None
+        )
+        
+        logger.info(f"✅ DIRECT TEXT PROCESSED: chunks={len(direct_result['chunks'])}")
+        
+        # Convert chunks to the format expected by generate_response
+        retrieved_chunks = []
+        for i, chunk in enumerate(direct_result['chunks']):
+            retrieved_chunks.append({
+                "content": chunk,
+                "metadata": {
+                    "filename": document_name,
+                    "session_id": session_id,
+                    "document_id": direct_result["document"].document_id,
+                    "chunk_id": f"direct_{i}",
+                    "is_direct": True
+                },
+                "score": 0.95 - (i * 0.05)  # Simulate relevance scores
+            })
+        
+        # Also try to get relevant chunks from the vector store for broader context
+        try:
+            vector_chunks = await self._retrieve_relevant_chunks(
+                query=query,
+                session_id=session_id,
+                case_file=case_file,
+                num_results=max(2, num_results // 2)  # Fewer results from vector store
+            )
+            logger.info(f"✅ RETRIEVED {len(vector_chunks)} ADDITIONAL CHUNKS FROM VECTOR STORE")
+            
+            # Combine the results, prioritizing direct chunks
+            retrieved_chunks.extend(vector_chunks)
+        except Exception as e:
+            logger.warning(f"⚠️ COULD NOT RETRIEVE FROM VECTOR STORE: {str(e)}")
+        
+        # Generate response using LLM with enhanced prompt
+        logger.info(f"🔄 GENERATING RESPONSE WITH DIRECT TEXT: session_id={session_id}")
+        response = await self._generate_response(
+            query=query,
+            retrieved_chunks=retrieved_chunks,
+            chat_history=self.chat_histories[session_id],
+            case_file=case_file,
+            conversation_state=conversation_state,
+            is_direct_text=True,
+            direct_document=direct_result["document"]
+        )
+        logger.info(f"✅ RESPONSE GENERATED: session_id={session_id}")
+        
+        # Add assistant response to history
+        self.chat_histories[session_id].append(ChatMessage(
+            role="assistant",
+            content=response.answer
+        ))
+        logger.info(f"✅ ASSISTANT RESPONSE ADDED TO HISTORY: session_id={session_id}")
+        
+        # Save updated chat history
+        self._save_chat_history(session_id)
+        
+        # Update conversation state with extracted facts
+        if response.extracted_facts:
+            logger.info(f"✅ EXTRACTED FACTS FOUND: session_id={session_id}")
+            conversation_state.update_case_file(response.extracted_facts)
+            
+        # Mark first response as complete if needed
+        if conversation_state.is_first_response:
+            logger.info(f"✅ MARKING FIRST RESPONSE COMPLETE: session_id={session_id}")
+            conversation_state.mark_first_response_complete()
+        
+        # Schedule background indexing of this text
+        document_processor = DocumentProcessor()
+        asyncio.create_task(direct_processor.schedule_background_indexing(
+            direct_result["document"].document_id,
+            document_processor,
+            session_id,
+            case_file.case_file_id if case_file else None
+        ))
+        
+        logger.info(f"✅ QUERY PROCESSING WITH DIRECT TEXT COMPLETED: session_id={session_id}")
+        return response
     
     async def _generate_response(
         self,
@@ -393,167 +567,193 @@ class RAGEngine:
         retrieved_chunks: List[Dict[str, Any]],
         chat_history: List[ChatMessage],
         case_file: Optional[CaseFile] = None,
-        conversation_state: Optional[ConversationState] = None
+        conversation_state: Optional[ConversationState] = None,
+        is_direct_text: bool = False,
+        direct_document: Optional[DocumentResponse] = None
     ) -> RAGResponse:
         """
-        Generate a response using the language model with retrieved context.
+        Generate a response using retrieved chunks and the LLM.
         
         Args:
             query: The user's query.
-            retrieved_chunks: The retrieved relevant chunks.
-            chat_history: The chat history for this session.
+            retrieved_chunks: List of relevant chunks with metadata.
+            chat_history: Chat history for this session.
             case_file: Optional case file with context.
-            conversation_state: The conversation state with case file information.
+            conversation_state: Optional conversation state.
+            is_direct_text: Whether this is a direct text processing request.
+            direct_document: Optional document info for direct text processing.
             
         Returns:
-            Generated response with sources and other metadata.
+            RAGResponse with answer, sources, and suggested questions.
         """
-        try:
-            from openai import OpenAI
-            client = OpenAI()
+        logger.info(f"🔄 GENERATING RESPONSE: query='{query}', chunks={len(retrieved_chunks)}")
+        
+        # Create a context with the retrieved chunks
+        context_parts = []
+        sources = []
+        
+        # Set used to track unique sources to avoid duplication
+        used_sources = set()
+        
+        # Add direct text notice if applicable
+        if is_direct_text and direct_document:
+            context_parts.append(f"NOTICE: This response includes direct analysis of the document '{direct_document.filename}' that was just uploaded and is still being processed.")
+        
+        # Sort chunks by score if available
+        sorted_chunks = sorted(retrieved_chunks, key=lambda x: x.get("score", 0), reverse=True)
+        
+        # Process each chunk
+        for i, chunk in enumerate(sorted_chunks):
+            content = chunk.get("content", "")
+            metadata = chunk.get("metadata", {})
+            score = chunk.get("score", 0)
             
-            # Prepare context from retrieved chunks
-            context = []
-            sources = []
-            
-            for i, chunk in enumerate(retrieved_chunks):
-                context.append(f"[Source {i+1}]: {chunk['text']}")
+            # Skip empty content
+            if not content.strip():
+                continue
                 
-                # Create source object for referencing
+            # Create a unique identifier for this source
+            source_id = f"{metadata.get('document_id', 'unknown')}_{metadata.get('chunk_id', i)}"
+            
+            # Skip if we've already used this exact source
+            if source_id in used_sources:
+                continue
+                
+            used_sources.add(source_id)
+            
+            # Add to context
+            context_parts.append(f"[{i+1}] {content}")
+            
+            # Create source
+            source_type = "document"
+            if metadata.get("is_direct", False):
+                source_type = "direct_document"
+            elif "law" in metadata.get("corpus_type", "").lower():
                 source_type = "law"
-                if "document_id" in chunk["metadata"]:
-                    source_type = "document"
                 
-                sources.append(Source(
-                    source_type=source_type,
-                    title=chunk["metadata"].get("filename", f"Source {i+1}"),
-                    content=chunk["text"],
-                    relevance_score=chunk["similarity"],
-                    document_id=chunk["metadata"].get("document_id")
-                ))
-            
-            context_str = "\n\n".join(context)
-            
-            # Prepare chat history context
-            history_str = ""
-            recent_history = chat_history[-10:] if len(chat_history) > 10 else chat_history
-            for msg in recent_history[:-1]:  # Exclude the current query
-                history_str += f"{msg.role.upper()}: {msg.content}\n"
-            
-            # Prepare case file context
-            case_file_str = ""
-            if conversation_state:
-                case_file_str = f"CURRENT CASE FILE:\n{conversation_state.get_yaml_case_file()}\n"
-            elif case_file:
-                case_file_str = "CASE FILE INFORMATION:\n"
-                case_file_str += f"Title: {case_file.title}\n"
-                if case_file.description:
-                    case_file_str += f"Description: {case_file.description}\n"
-                
-                if case_file.facts:
-                    case_file_str += "Facts:\n"
-                    for key, value in case_file.facts.items():
-                        if isinstance(value, dict):
-                            case_file_str += f"- {key}:\n"
-                            for subkey, subvalue in value.items():
-                                case_file_str += f"  - {subkey}: {subvalue}\n"
-                        else:
-                            case_file_str += f"- {key}: {value}\n"
-            
-            # Use the enhanced system prompt
-            system_prompt = get_system_prompt()
-            
-            # Build the prompt for generating the response
-            user_prompt = f"""QUERY: {query}
-
-CHAT HISTORY:
-{history_str}
-
-{case_file_str}
-
-RELEVANT LEGAL SOURCES (ProvidedCorpus):
-{context_str}
-
-The legal sources above are from the ProvidedCorpus. Answer the query based ONLY on these provided legal sources. Cite specific sources in your answer (e.g., "According to [Source 3]..."). Be helpful, accurate, and clear.
-
-If you extract any new facts about the user's situation, include them in a separate YAML-formatted "EXTRACTED_FACTS" section at the end of your response.
-
-Remember to ask exactly one question per message, and make it the next most relevant question based on what you've learned so far.
-"""
-
-            # Check if this is the first response
-            is_first_response = conversation_state and conversation_state.is_first_response
-            temperature = 0.1  # Lower temperature for more consistent responses
-            
-            # Make the API call
-            response = client.chat.completions.create(
-                model="gpt-4-turbo",
-                messages=[
-                    {"role": "system", "content": system_prompt},
-                    {"role": "user", "content": user_prompt}
-                ],
-                temperature=temperature
+            source = Source(
+                source_type=source_type,
+                title=metadata.get("filename", f"Source {i+1}"),
+                content=content[:500] + ("..." if len(content) > 500 else ""),
+                citation=metadata.get("citation", None),
+                relevance_score=score,
+                document_id=metadata.get("document_id", None)
             )
             
-            answer = response.choices[0].message.content
+            sources.append(source)
             
-            # Extract the suggested questions (we'll still extract them, but our prompt will only show one)
-            suggested_questions = []
-            next_question_patterns = [
-                "Next question:", 
-                "My next question for you is:", 
-                "My question for you is:",
-                "Can you tell me"
-            ]
+            # Limit the number of sources to avoid overwhelming the LLM
+            if len(sources) >= 10:
+                break
+        
+        # Combine the context parts
+        if context_parts:
+            context = "\n\n".join(context_parts)
+        else:
+            # Provide a fallback for no context
+            context = "No specific information found for this query."
             
-            for pattern in next_question_patterns:
-                if pattern in answer:
-                    parts = answer.split(pattern, 1)
-                    if len(parts) > 1:
-                        question_text = parts[1].strip().split("\n")[0].strip()
-                        if question_text and question_text not in suggested_questions:
-                            if question_text.endswith("?"):
-                                suggested_questions.append(question_text)
+        # Prepare chat history
+        history_text = []
+        for msg in chat_history[-6:]:  # Include up to 6 most recent messages
+            role = "User" if msg.role == "user" else "Assistant"
+            history_text.append(f"{role}: {msg.content}")
+        
+        history_str = "\n".join(history_text)
+        
+        # Get case file yaml if available
+        case_file_yaml = ""
+        if conversation_state:
+            case_file_yaml = conversation_state.get_yaml_case_file()
             
-            # If we didn't find any specific questions but there are question marks, look for those
-            if not suggested_questions:
-                for line in answer.split("\n"):
-                    line = line.strip()
-                    if "?" in line and len(line) < 200:  # Reasonable length for a question
-                        question_part = line.split("?")[0] + "?"
-                        if question_part not in suggested_questions:
-                            suggested_questions.append(question_part)
+        # Prepare case file section if available
+        case_file_section = ""
+        if case_file_yaml:
+            case_file_section = f"""CASE FILE:
+{case_file_yaml}
+
+"""
+
+        # Build the prompt
+        user_prompt = f"""QUERY: {query}
+
+CONVERSATION HISTORY:
+{history_str}
+
+{case_file_section}
+RELEVANT INFORMATION:
+{context}
+
+Based on the above information, please provide a comprehensive answer to the user's query.
+Include specific references to the sources when appropriate.
+If you extract any new facts about the user's situation, include them in a separate YAML-formatted "EXTRACTED_FACTS" section.
+
+Also suggest 2-3 follow-up questions the user might want to ask next based on their current query and the available information."""
+        
+        # Use system prompt from the core
+        system_prompt = get_system_prompt(conversation_state=conversation_state)
+        
+        # Call the LLM for a response
+        try:
+            response_text = await self.llm_service.generate_response(
+                system_prompt=system_prompt,
+                user_prompt=user_prompt,
+                use_streaming=False
+            )
             
-            # Extract any facts if present
-            extracted_facts = {}
-            if "EXTRACTED_FACTS" in answer:
-                facts_section = answer.split("EXTRACTED_FACTS:")[1].strip()
-                # Take until next section if there is one
+            logger.info(f"✅ LLM RESPONSE GENERATED: length={len(response_text)}")
+        except Exception as e:
+            logger.error(f"❌ ERROR GENERATING LLM RESPONSE: {str(e)}")
+            response_text = f"I'm sorry, I encountered an error while processing your request. Error: {str(e)}"
+        
+        # Extract facts and suggested questions
+        extracted_facts = {}
+        suggested_questions = []
+        
+        # Parse the response for facts and questions
+        if "EXTRACTED_FACTS:" in response_text:
+            import yaml
+            try:
+                facts_section = response_text.split("EXTRACTED_FACTS:")[1].strip()
                 if "\n\n" in facts_section:
                     facts_section = facts_section.split("\n\n")[0]
                 
-                try:
-                    # Try to parse as YAML
-                    extracted_facts = yaml.safe_load(facts_section)
-                except Exception as e:
-                    print(f"Error parsing extracted facts: {e}")
-            
-            # Clean up the answer (remove the special sections)
-            if "EXTRACTED_FACTS:" in answer:
-                answer = answer.split("EXTRACTED_FACTS:")[0].strip()
-            
-            return RAGResponse(
-                answer=answer,
-                sources=sources,
-                suggested_questions=suggested_questions[:3],  # Limit to top 3 suggestions
-                extracted_facts=extracted_facts
-            )
-            
-        except Exception as e:
-            print(f"Error generating response: {e}")
-            return RAGResponse(
-                answer=f"I apologize, but I encountered an error while processing your request: {str(e)}. Please try again or contact support if the issue persists.",
-                sources=[],
-                suggested_questions=[],
-                extracted_facts={}
-            ) 
+                # Parse the YAML facts
+                extracted_facts = yaml.safe_load(facts_section)
+                
+                # Remove the facts section from the response
+                response_text = response_text.split("EXTRACTED_FACTS:")[0].strip()
+                
+                logger.info(f"✅ EXTRACTED FACTS: {extracted_facts}")
+            except Exception as e:
+                logger.error(f"❌ ERROR PARSING EXTRACTED FACTS: {str(e)}")
+        
+        # Extract suggested questions
+        if "follow-up questions" in response_text.lower():
+            try:
+                # Try to find the section with suggested questions
+                sections = response_text.split("\n\n")
+                for section in sections:
+                    if "follow-up questions" in section.lower() or "suggested questions" in section.lower():
+                        # Extract questions (look for numbered or bulleted items)
+                        question_matches = re.findall(r"(?:^|\n)[*\-\d.)\s]+([^*\-\d.)\n][^\n]+\?)", section)
+                        if question_matches:
+                            suggested_questions = [q.strip() for q in question_matches]
+                            
+                            # Remove the questions section if it's at the end
+                            if sections[-1] == section:
+                                response_text = response_text.replace(section, "").strip()
+                                
+                        break
+                
+                logger.info(f"✅ SUGGESTED QUESTIONS: {suggested_questions}")
+            except Exception as e:
+                logger.error(f"❌ ERROR EXTRACTING SUGGESTED QUESTIONS: {str(e)}")
+        
+        # Create and return the RAG response
+        return RAGResponse(
+            answer=response_text,
+            sources=sources,
+            suggested_questions=suggested_questions[:3],  # Limit to 3 questions
+            extracted_facts=extracted_facts
+        ) 

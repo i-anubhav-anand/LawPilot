@@ -6,6 +6,7 @@ class ChatSession(BaseModel):
     """Information about a chat session."""
     session_id: str
     message_count: int
+    created_at: Optional[str] = None
 
 class ChatSessionList(BaseModel):
     """List of chat sessions."""

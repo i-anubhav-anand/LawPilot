@@ -16,6 +16,7 @@ import concurrent.futures
 from app.models.documents import DocumentResponse
 from app.core.vector_store import VectorStore
 from app.core.text_chunker import TextChunker
+from app.core.vision_service import VisionService
 
 # Set up logging
 logging.basicConfig(level=logging.INFO)
@@ -50,8 +51,8 @@ class DocumentProcessor:
         """Initialize the document processor."""
         self.document_store = {}  # In-memory store, will be persisted to disk
         self.vector_store = VectorStore()
-        # Use smaller chunk size by default to avoid getting stuck
         self.text_chunker = TextChunker(chunk_size=300, chunk_overlap=50, max_chunk_time=60)
+        self.vision_service = VisionService()
         
         # Create a dedicated thread pool for CPU-bound tasks
         self.thread_pool = concurrent.futures.ThreadPoolExecutor(max_workers=4)
@@ -65,6 +66,78 @@ class DocumentProcessor:
         # Load document metadata from disk
         self._load_document_metadata()
         
+        # Sync document store with vector store
+        asyncio.create_task(self._sync_with_vector_store())
+        
+    async def _sync_with_vector_store(self):
+        """Synchronize the document store with the vector store to ensure consistency."""
+        try:
+            logger.info("🔄 SYNCING DOCUMENT STORE WITH VECTOR STORE")
+            
+            # Get all documents from vector store
+            vector_docs = await self.vector_store.get_all_documents()
+            vector_doc_ids = {doc["document_id"] for doc in vector_docs}
+            
+            # Get all documents from document store
+            doc_store_ids = set(self.document_store.keys())
+            
+            # Find documents in vector store but not in document store
+            missing_in_doc_store = vector_doc_ids - doc_store_ids
+            if missing_in_doc_store:
+                logger.warning(f"⚠️ FOUND {len(missing_in_doc_store)} DOCUMENTS IN VECTOR STORE BUT NOT IN DOCUMENT STORE")
+                for doc_id in missing_in_doc_store:
+                    # If we have the processed file, try to restore the document
+                    processed_path = Path("processed") / f"{doc_id}.json"
+                    if processed_path.exists():
+                        try:
+                            with open(processed_path, "r") as f:
+                                processed_data = json.load(f)
+                                
+                            # Create document entry
+                            self.document_store[doc_id] = DocumentResponse(
+                                document_id=doc_id,
+                                filename=processed_data.get("filename", f"{doc_id}.pdf"),
+                                session_id=processed_data.get("session_id"),
+                                case_file_id=processed_data.get("case_file_id"),
+                                status="processed",
+                                created_at=datetime.now(),
+                                processed_at=datetime.now(),
+                                is_global=processed_data.get("is_global", False)
+                            )
+                            
+                            # Save the restored metadata
+                            self._save_document_metadata(doc_id)
+                            logger.info(f"✅ RESTORED DOCUMENT METADATA: id={doc_id}")
+                        except Exception as e:
+                            logger.error(f"❌ ERROR RESTORING DOCUMENT METADATA: id={doc_id}, error={str(e)}")
+            
+            # Find documents in document store but not in vector store
+            missing_in_vector_store = doc_store_ids - vector_doc_ids
+            if missing_in_vector_store:
+                logger.warning(f"⚠️ FOUND {len(missing_in_vector_store)} DOCUMENTS IN DOCUMENT STORE BUT NOT IN VECTOR STORE")
+                for doc_id in missing_in_vector_store:
+                    if self.document_store[doc_id].status == "processed":
+                        # Mark as failed since it's missing from vector store
+                        self.document_store[doc_id] = DocumentResponse(
+                            document_id=doc_id,
+                            filename=self.document_store[doc_id].filename,
+                            session_id=self.document_store[doc_id].session_id,
+                            case_file_id=self.document_store[doc_id].case_file_id,
+                            status="failed",
+                            created_at=self.document_store[doc_id].created_at,
+                            processed_at=self.document_store[doc_id].processed_at,
+                            error="Document missing from vector store - reprocessing required",
+                            is_global=self.document_store[doc_id].is_global
+                        )
+                        # Save the updated metadata
+                        self._save_document_metadata(doc_id)
+                        logger.info(f"⚠️ MARKED DOCUMENT AS FAILED DUE TO MISSING VECTOR DATA: id={doc_id}")
+            
+            logger.info("✅ DOCUMENT STORE SYNCED WITH VECTOR STORE")
+            
+        except Exception as e:
+            logger.error(f"❌ ERROR SYNCING DOCUMENT STORE WITH VECTOR STORE: {str(e)}", exc_info=True)
+            
     def _load_document_metadata(self):
         """Load document metadata from disk."""
         metadata_dir = Path("documents_metadata")
@@ -141,84 +214,93 @@ class DocumentProcessor:
         document_id: str, 
         session_id: Optional[str] = None,
         case_file_id: Optional[str] = None,
-        is_global: bool = False
+        is_global: bool = False,
+        metadata: Optional[Dict[str, Any]] = None
     ):
         """
-        Process a document: extract text, chunk it, and store in vector DB.
+        Process a document by extracting text, chunking, and storing in vector DB.
         
         Args:
             file_path: Path to the document file
             document_id: Unique ID for the document
-            session_id: Optional session ID for associating with a chat session
-            case_file_id: Optional case file ID for associating with a case file
+            session_id: Optional session ID to associate with this document
+            case_file_id: Optional case file ID to associate with this document
             is_global: Whether this document should be available to all sessions
+            metadata: Optional additional metadata about the document
+        
+        Returns:
+            None - updates are made to the document store
         """
+        # Create a document record
+        document = DocumentResponse(
+            document_id=document_id,
+            filename=os.path.basename(file_path),
+            session_id=session_id,
+            case_file_id=case_file_id,
+            status="processing",
+            is_global=is_global
+        )
+        
+        # Add to document store
+        self.document_store[document_id] = document
+        
+        # Save initial document metadata
+        self._save_document_metadata(document_id)
+        
         try:
-            # Initialize document in store
-            self.document_store[document_id] = DocumentResponse(
-                document_id=document_id,
-                filename=Path(file_path).name,
-                session_id=session_id,
-                case_file_id=case_file_id,
-                status="processing",
-                is_global=is_global
-            )
+            logger.info(f"🔄 PROCESSING DOCUMENT: id={document_id}, file={file_path}")
+            self.last_processing_time = time.time()
+            self.is_processing = True
+            self.processing_document_id = document_id
             
-            # Save initial metadata
-            self._save_document_metadata(document_id)
+            # Initialize metadata if not provided
+            if metadata is None:
+                metadata = {}
             
-            logger.info(f"🔄 STARTED PROCESSING DOCUMENT: id={document_id}, file={Path(file_path).name}, global={is_global}")
+            # Check if this is an image file that needs vision analysis
+            is_image = self._is_image_file(file_path)
             
-            # Check file size
-            file_size = os.path.getsize(file_path)
-            file_size_mb = file_size / (1024 * 1024)
-            logger.info(f"📊 DOCUMENT SIZE: {file_size_mb:.2f} MB")
+            # Use vision if specified in metadata or if image and should use vision
+            use_vision = metadata.get('use_vision', False) or (is_image and self._should_use_vision(file_path))
             
-            # For large documents, use a different chunking strategy
-            is_large_document = file_size_mb > 2  # Consider files > 2MB as large
-            
-            # Extract text from document
-            start_time = time.time()
-            logger.info(f"🔄 EXTRACTING TEXT: file={file_path}")
-            
-            # Run text extraction in thread pool to avoid blocking
-            loop = asyncio.get_event_loop()
-            try:
-                extraction_task = loop.run_in_executor(self.thread_pool, lambda: self._extract_text(file_path))
-                # Set a timeout for text extraction based on file size (30 seconds + 5 seconds per MB)
-                extraction_timeout = 30 + (file_size_mb * 5)
-                text = await asyncio.wait_for(extraction_task, timeout=extraction_timeout)
-            except asyncio.TimeoutError:
-                logger.error(f"⚠️ TEXT EXTRACTION TIMEOUT: File processing took longer than {extraction_timeout} seconds")
-                raise TimeoutError(f"Text extraction timed out after {extraction_timeout} seconds")
-            
-            text_extraction_time = time.time() - start_time
-            logger.info(f"✅ TEXT EXTRACTED: {len(text)} characters, time={text_extraction_time:.2f}s")
+            # Extract text from the document
+            if use_vision and is_image:
+                logger.info(f"🔄 USING VISION MODEL FOR IMAGE ANALYSIS: {file_path}")
+                vision_result = await self.vision_service.analyze_image(file_path)
+                text = vision_result.get("analysis", "")
+                
+                # If there was an error with vision analysis, fall back to OCR
+                if "error" in vision_result:
+                    logger.warning(f"⚠️ VISION ANALYSIS FAILED, FALLING BACK TO OCR: {vision_result.get('error')}")
+                    text = self._extract_text(file_path)
+            else:
+                # Use regular text extraction
+                text = self._extract_text(file_path)
+                
+            if not text or len(text.strip()) == 0:
+                logger.warning(f"⚠️ NO TEXT EXTRACTED FROM DOCUMENT: id={document_id}")
+                raise ValueError("No text could be extracted from the document")
+                
+            logger.info(f"✅ TEXT EXTRACTED: id={document_id}, length={len(text)}")
             
             # Chunk the text with progress reporting
             logger.info(f"🔄 CHUNKING TEXT: document={document_id}")
             chunk_start_time = time.time()
             
             # Adaptive chunk size based on document size
-            if is_large_document:
-                logger.info(f"⚠️ LARGE DOCUMENT DETECTED: Using smaller chunk size")
-                chunk_size = 200
-                chunk_overlap = 50
-            else:
-                chunk_size = 300
-                chunk_overlap = 50
+            is_large_document = os.path.getsize(file_path) > 2 * (1024 * 1024)  # Consider files > 2MB as large
             
             # Create a special chunker instance with appropriate settings for this document
             document_chunker = TextChunker(
-                chunk_size=chunk_size, 
-                chunk_overlap=chunk_overlap,
+                chunk_size=300 if not is_large_document else 200, 
+                chunk_overlap=50,
                 max_chunk_time=60  # 1 minute max for chunking
             )
             
             try:
-                chunking_task = loop.run_in_executor(self.thread_pool, lambda: document_chunker.chunk_text(text))
+                chunking_task = self.thread_pool.submit(lambda: document_chunker.chunk_text(text))
                 # Set timeout for chunking (30 seconds + 10 seconds per MB)
-                chunking_timeout = 30 + (file_size_mb * 10)
+                chunking_timeout = 30 + (os.path.getsize(file_path) / (1024 * 1024) * 10)
                 chunks = await asyncio.wait_for(chunking_task, timeout=chunking_timeout)
             except asyncio.TimeoutError:
                 logger.error(f"⚠️ CHUNKING TIMEOUT: Text chunking took longer than {chunking_timeout} seconds")
@@ -265,7 +347,7 @@ class DocumentProcessor:
                             document_id=document_id,
                             chunks=batch,
                             metadata={
-                                "filename": Path(file_path).name,
+                                "filename": os.path.basename(file_path),
                                 "session_id": session_id,
                                 "case_file_id": case_file_id,
                                 "batch": f"{processed_chunks+1}-{batch_end}/{len(all_chunks)}",
@@ -310,7 +392,7 @@ class DocumentProcessor:
                             document_id=document_id,
                             chunks=chunks,
                             metadata={
-                                "filename": Path(file_path).name,
+                                "filename": os.path.basename(file_path),
                                 "session_id": session_id,
                                 "case_file_id": case_file_id,
                                 "is_global": is_global
@@ -332,22 +414,22 @@ class DocumentProcessor:
             
             processed_data = {
                 "document_id": document_id,
-                "filename": Path(file_path).name,
+                "filename": os.path.basename(file_path),
                 "text": text,
                 "chunks": chunks,
                 "session_id": session_id,
                 "case_file_id": case_file_id,
                 "processing_stats": {
-                    "text_extraction_time": text_extraction_time,
+                    "text_extraction_time": time.time() - self.last_processing_time,
                     "chunking_time": chunking_time,
-                    "embedding_time": time.time() - start_time - text_extraction_time - chunking_time,
+                    "embedding_time": time.time() - self.last_processing_time - chunking_time,
                     "num_chunks": len(chunks),
                     "total_characters": len(text)
                 }
             }
             
             # Write to file in thread pool
-            await loop.run_in_executor(
+            await asyncio.run_in_executor(
                 self.thread_pool, 
                 lambda: json.dump(processed_data, open(processed_path, "w"))
             )
@@ -357,7 +439,7 @@ class DocumentProcessor:
             # Update document status
             self.document_store[document_id] = DocumentResponse(
                 document_id=document_id,
-                filename=Path(file_path).name,
+                filename=os.path.basename(file_path),
                 session_id=session_id,
                 case_file_id=case_file_id,
                 status="processed",
@@ -369,7 +451,7 @@ class DocumentProcessor:
             # Save updated metadata
             self._save_document_metadata(document_id)
             
-            total_processing_time = time.time() - start_time
+            total_processing_time = time.time() - self.last_processing_time
             logger.info(f"✅ DOCUMENT PROCESSING COMPLETED: id={document_id}, total_time={total_processing_time:.2f}s")
             
             # If document is part of a case file, update case file
@@ -392,7 +474,7 @@ class DocumentProcessor:
             # Update document with error
             self.document_store[document_id] = DocumentResponse(
                 document_id=document_id,
-                filename=Path(file_path).name,
+                filename=os.path.basename(file_path),
                 session_id=session_id,
                 case_file_id=case_file_id,
                 status="failed",
@@ -406,7 +488,7 @@ class DocumentProcessor:
             # Update document with error
             self.document_store[document_id] = DocumentResponse(
                 document_id=document_id,
-                filename=Path(file_path).name,
+                filename=os.path.basename(file_path),
                 session_id=session_id,
                 case_file_id=case_file_id,
                 status="failed",
@@ -477,12 +559,218 @@ class DocumentProcessor:
             raise
     
     def _extract_from_image(self, file_path: str) -> str:
-        """Extract text from an image using OCR."""
-        logger.info(f"🔄 EXTRACTING TEXT FROM IMAGE USING OCR: {file_path}")
+        """
+        Extract text from an image using Tesseract OCR.
+        This is a fallback if vision analysis isn't available.
+        
+        Args:
+            file_path: Path to the image file
+            
+        Returns:
+            Extracted text
+        """
         try:
-            text = pytesseract.image_to_string(Image.open(file_path))
-            logger.info(f"✅ OCR EXTRACTION COMPLETED: {len(text)} characters")
+            logger.info(f"🔄 EXTRACTING TEXT FROM IMAGE: {file_path}")
+            image = Image.open(file_path)
+            text = pytesseract.image_to_string(image)
+            
+            logger.info(f"✅ TEXT EXTRACTED FROM IMAGE: length={len(text)}")
             return text
         except Exception as e:
-            logger.error(f"❌ OCR EXTRACTION ERROR: {str(e)}")
-            raise 
+            logger.error(f"❌ ERROR EXTRACTING TEXT FROM IMAGE: {str(e)}")
+            return f"[Error extracting text from image: {str(e)}]"
+
+    async def retry_failed_document(self, document_id: str, max_attempts: int = 3) -> Optional[DocumentResponse]:
+        """
+        Retry processing a failed document.
+        
+        Args:
+            document_id: ID of the document to retry
+            max_attempts: Maximum number of retry attempts
+            
+        Returns:
+            Updated document response or None if retry failed
+        """
+        logger.info(f"🔄 RETRYING FAILED DOCUMENT: id={document_id}, max_attempts={max_attempts}")
+        
+        # Get the document
+        document = self.get_document(document_id)
+        if not document:
+            logger.error(f"❌ DOCUMENT NOT FOUND FOR RETRY: id={document_id}")
+            return None
+        
+        # Only retry if the document failed or is marked for retry
+        if document.status not in ["failed", "retry_requested"]:
+            logger.warning(f"⚠️ DOCUMENT NOT FAILED OR MARKED FOR RETRY: id={document_id}, status={document.status}")
+            return document
+        
+        # Check if we have the original file
+        original_file_path = None
+        for dir_path in ["uploads", "direct_text_cache"]:
+            # Check both the original name format and text file format
+            potential_paths = [
+                Path(f"{dir_path}/{document_id}_{document.filename}"),
+                Path(f"{dir_path}/{document_id}.txt"),
+                Path(f"{dir_path}/{document_id}")
+            ]
+            
+            for path in potential_paths:
+                if path.exists():
+                    original_file_path = path
+                    break
+            
+            if original_file_path:
+                break
+        
+        if not original_file_path:
+            logger.error(f"❌ ORIGINAL FILE NOT FOUND FOR RETRY: id={document_id}")
+            return None
+        
+        logger.info(f"✅ ORIGINAL FILE FOUND: path={original_file_path}")
+        
+        # Update document status to indicate retry
+        document.status = "processing"
+        document.error = None
+        self._save_document_metadata(document_id)
+        
+        # Try to process the document again
+        retry_count = 0
+        last_error = None
+        
+        while retry_count < max_attempts:
+            retry_count += 1
+            logger.info(f"🔄 RETRY ATTEMPT {retry_count}/{max_attempts}")
+            
+            try:
+                # Process the document
+                await self.process_document(
+                    file_path=str(original_file_path),
+                    document_id=document_id,
+                    session_id=document.session_id,
+                    case_file_id=document.case_file_id,
+                    is_global=document.is_global
+                )
+                
+                # Check if processing was successful
+                updated_document = self.get_document(document_id)
+                if updated_document and updated_document.status == "processed":
+                    logger.info(f"✅ DOCUMENT RETRY SUCCESSFUL: id={document_id}")
+                    return updated_document
+                
+                # Allow a short sleep between retries
+                await asyncio.sleep(0.5)
+                
+            except Exception as e:
+                last_error = str(e)
+                logger.error(f"❌ RETRY ATTEMPT {retry_count} FAILED: id={document_id}, error={last_error}")
+                
+                # Increment back-off delay for next retry
+                await asyncio.sleep(retry_count * 0.5)
+        
+        # All retries failed
+        document = self.get_document(document_id)
+        if document:
+            document.status = "failed"
+            document.error = f"Retry failed after {max_attempts} attempts. Last error: {last_error or 'Unknown error'}"
+            document.processed_at = datetime.now()
+            self._save_document_metadata(document_id)
+        
+        logger.error(f"❌ ALL RETRY ATTEMPTS FAILED: id={document_id}, attempts={max_attempts}")
+        return document
+
+    async def recover_all_failed_documents(self, max_attempts: int = 2) -> Dict[str, str]:
+        """
+        Try to recover all failed documents.
+        
+        Args:
+            max_attempts: Maximum number of retry attempts per document
+            
+        Returns:
+            Dictionary mapping document IDs to their recovery status
+        """
+        logger.info(f"🔄 RECOVERING ALL FAILED DOCUMENTS: max_attempts={max_attempts}")
+        
+        # Get all failed documents
+        failed_documents = [doc for doc in self.document_store.values() if doc.status == "failed"]
+        
+        if not failed_documents:
+            logger.info("✅ NO FAILED DOCUMENTS TO RECOVER")
+            return {}
+        
+        logger.info(f"🔄 FOUND {len(failed_documents)} FAILED DOCUMENTS TO RECOVER")
+        
+        # Try to recover each document
+        results = {}
+        for document in failed_documents:
+            try:
+                logger.info(f"🔄 ATTEMPTING TO RECOVER DOCUMENT: id={document.document_id}")
+                recovered_document = await self.retry_failed_document(document.document_id, max_attempts)
+                
+                if recovered_document and recovered_document.status == "processed":
+                    results[document.document_id] = "recovered"
+                    logger.info(f"✅ DOCUMENT RECOVERED: id={document.document_id}")
+                else:
+                    results[document.document_id] = "failed"
+                    logger.warning(f"⚠️ DOCUMENT RECOVERY FAILED: id={document.document_id}")
+                
+                # Allow a delay between processing documents
+                await asyncio.sleep(0.5)
+                
+            except Exception as e:
+                results[document.document_id] = f"error: {str(e)}"
+                logger.error(f"❌ ERROR RECOVERING DOCUMENT: id={document.document_id}, error={str(e)}")
+        
+        logger.info(f"✅ RECOVERY PROCESS COMPLETED: {results}")
+        return results
+
+    # Add a method to mark a document for retry
+    def mark_document_for_retry(self, document_id: str) -> Optional[DocumentResponse]:
+        """
+        Mark a document for retry processing.
+        
+        Args:
+            document_id: ID of the document to mark for retry
+            
+        Returns:
+            Updated document response or None if document not found
+        """
+        document = self.get_document(document_id)
+        if not document:
+            logger.error(f"❌ DOCUMENT NOT FOUND FOR RETRY MARKING: id={document_id}")
+            return None
+        
+        # Mark for retry
+        document.status = "retry_requested"
+        document.error = None
+        self._save_document_metadata(document_id)
+        
+        logger.info(f"✅ DOCUMENT MARKED FOR RETRY: id={document_id}")
+        return document
+
+    def _is_image_file(self, file_path: str) -> bool:
+        """
+        Check if the file is an image based on its extension.
+        
+        Args:
+            file_path: Path to the file
+            
+        Returns:
+            True if this is an image file, False otherwise
+        """
+        file_extension = Path(file_path).suffix.lower()
+        image_extensions = ['.jpg', '.jpeg', '.png', '.gif', '.webp']
+        return file_extension in image_extensions
+    
+    def _should_use_vision(self, file_path: str) -> bool:
+        """
+        Determine if we should use vision analysis for this file.
+        Currently, we use vision for all image files, but this could
+        be made more sophisticated based on file size, content, etc.
+        
+        Args:
+            file_path: Path to the file
+            
+        Returns:
+            True if vision analysis should be used
+        """
+        return self._is_image_file(file_path) 

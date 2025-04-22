@@ -89,11 +89,30 @@ If you extract any new facts about the user's situation, include them in a separ
             try:
                 extracted_facts = yaml.safe_load(facts_section)
                 
+                # Ensure extracted_facts is a dictionary, not a list
+                if isinstance(extracted_facts, list):
+                    # Convert list to dictionary with numeric keys
+                    facts_dict = {}
+                    for i, item in enumerate(extracted_facts):
+                        if isinstance(item, dict):
+                            # If each list item is a dictionary with a single key-value pair,
+                            # merge all dictionaries
+                            facts_dict.update(item)
+                        else:
+                            # Otherwise use index as key
+                            facts_dict[f"fact_{i+1}"] = item
+                    extracted_facts = facts_dict
+                
+                # Ensure we always have a dictionary, even if parsing failed
+                if not isinstance(extracted_facts, dict):
+                    extracted_facts = {"raw_facts": str(extracted_facts)}
+                
                 # Update conversation state if available
                 if conversation_state and extracted_facts:
                     conversation_state.update_case_file(extracted_facts)
             except Exception as e:
                 print(f"Error parsing extracted facts: {e}")
+                extracted_facts = {"error": f"Could not parse extracted facts: {str(e)}"}
             
             # Clean up the answer
             clean_answer = answer.split("EXTRACTED_FACTS:")[0].strip()

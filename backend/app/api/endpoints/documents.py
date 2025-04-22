@@ -1,14 +1,17 @@
-from fastapi import APIRouter, UploadFile, File, HTTPException, Form, BackgroundTasks
+from fastapi import APIRouter, UploadFile, File, HTTPException, Form, BackgroundTasks, Depends
 from typing import List, Optional, Dict, Any
 import uuid
 import os
 from pathlib import Path
 import logging
 from datetime import datetime
+import time
+import asyncio
 
 from app.core.document_processor import DocumentProcessor
 from app.core.rag_engine import RAGEngine
 from app.models.documents import DocumentResponse, DocumentAnalysisResponse
+from app.api.deps import get_document_processor
 
 # Set up logging
 logger = logging.getLogger("documents_api")
@@ -38,12 +41,16 @@ async def upload_document(
     file: UploadFile = File(...),
     session_id: Optional[str] = Form(None),
     case_file_id: Optional[str] = Form(None),
-    background_tasks: BackgroundTasks = None
+    background_tasks: BackgroundTasks = None,
+    use_vision: bool = Form(True)  # Add a flag to control vision analysis
 ):
     """
     Upload a document for processing and analysis.
+    
+    For image files, the system will automatically use vision analysis
+    if the use_vision flag is set to True (default).
     """
-    logger.info(f"📤 DOCUMENT UPLOAD: filename={file.filename}, session_id={session_id}")
+    logger.info(f"📤 DOCUMENT UPLOAD: filename={file.filename}, session_id={session_id}, use_vision={use_vision}")
     
     # Generate IDs if not provided
     session_id = session_id or str(uuid.uuid4())
@@ -51,11 +58,14 @@ async def upload_document(
     
     # Save the uploaded file
     file_extension = Path(file.filename).suffix.lower()
-    allowed_extensions = ['.pdf', '.txt', '.docx', '.doc', '.jpg', '.jpeg', '.png']
+    allowed_extensions = ['.pdf', '.txt', '.docx', '.doc', '.jpg', '.jpeg', '.png', '.gif', '.webp']
     
     if file_extension not in allowed_extensions:
         logger.warning(f"❌ UNSUPPORTED FILE FORMAT: {file_extension}")
         raise HTTPException(status_code=400, detail="Unsupported file format")
+    
+    # Check if this is an image file
+    is_image = file_extension in ['.jpg', '.jpeg', '.png', '.gif', '.webp']
     
     # Create uploads directory if it doesn't exist
     upload_dir = Path("uploads")
@@ -70,15 +80,25 @@ async def upload_document(
     logger.info(f"✅ FILE SAVED: path={file_path}")
     
     # Process document in background
-    logger.info(f"🔄 STARTING BACKGROUND DOCUMENT PROCESSING: id={document_id}")
+    logger.info(f"🔄 STARTING BACKGROUND DOCUMENT PROCESSING: id={document_id}, is_image={is_image}, use_vision={use_vision}")
     
     # Wrap async function for background tasks
     async def process_document_wrapper():
-        await document_processor.process_document(
+        # Initialize a document processor
+        doc_processor = DocumentProcessor()
+        
+        # For image files, we add a special metadata flag for vision analysis
+        metadata = {
+            "is_image": is_image,
+            "use_vision": use_vision and is_image
+        }
+        
+        await doc_processor.process_document(
             str(file_path),
             document_id,
             session_id,
-            case_file_id
+            case_file_id,
+            metadata=metadata
         )
     
     background_tasks.add_task(process_document_wrapper)
@@ -320,4 +340,150 @@ async def toggle_document_global_status(
         return updated_document
     except Exception as e:
         logger.error(f"❌ ERROR UPDATING DOCUMENT GLOBAL STATUS: id={document_id}, error={str(e)}")
-        raise HTTPException(status_code=500, detail=f"Error updating document global status: {str(e)}") 
+        raise HTTPException(status_code=500, detail=f"Error updating document global status: {str(e)}")
+
+@router.post("/extract-text", response_model=Dict[str, Any])
+async def extract_document_text(
+    file: UploadFile = File(...),
+    document_processor: DocumentProcessor = Depends(get_document_processor)
+):
+    """
+    Extract text from a document without storing it in the vector database.
+    
+    This endpoint extracts text from documents (PDF, images, etc.) and returns the raw text.
+    It's designed for immediate client-side use without waiting for indexing.
+    
+    The extracted text can be sent to the /chat/with-document-text endpoint for dual-path processing.
+    """
+    logger.info(f"🔄 EXTRACTING TEXT FROM DOCUMENT: filename={file.filename}")
+    
+    try:
+        # Create a unique temporary file
+        temp_file_id = f"temp_{uuid.uuid4()}"
+        
+        # Create a temporary storage directory
+        upload_dir = Path("uploads/temp")
+        upload_dir.mkdir(exist_ok=True, parents=True)
+        
+        # Save the uploaded file
+        temp_file_path = upload_dir / f"{temp_file_id}_{file.filename}"
+        with open(temp_file_path, "wb") as f:
+            contents = await file.read()
+            f.write(contents)
+        
+        # Extract text based on file type
+        logger.info(f"✅ FILE SAVED: path={temp_file_path}")
+        
+        # Use the document processor to extract text
+        start_time = time.time()
+        
+        # Run extraction in thread pool to avoid blocking
+        loop = asyncio.get_event_loop()
+        extraction_task = loop.run_in_executor(
+            None, 
+            lambda: document_processor._extract_text(str(temp_file_path))
+        )
+        
+        # Set a timeout for text extraction (30 seconds + 5 seconds per MB)
+        file_size = os.path.getsize(temp_file_path)
+        file_size_mb = file_size / (1024 * 1024)
+        extraction_timeout = 30 + (file_size_mb * 5)
+        
+        try:
+            extracted_text = await asyncio.wait_for(extraction_task, timeout=extraction_timeout)
+        except asyncio.TimeoutError:
+            logger.error(f"⚠️ TEXT EXTRACTION TIMEOUT: Took longer than {extraction_timeout}s")
+            raise HTTPException(
+                status_code=500,
+                detail=f"Text extraction timed out after {extraction_timeout} seconds"
+            )
+        
+        extraction_time = time.time() - start_time
+        logger.info(f"✅ TEXT EXTRACTED: {len(extracted_text)} characters in {extraction_time:.2f}s")
+        
+        # Clean up the temporary file
+        try:
+            os.remove(temp_file_path)
+            logger.info(f"✅ TEMPORARY FILE REMOVED: {temp_file_path}")
+        except Exception as e:
+            logger.warning(f"⚠️ COULD NOT REMOVE TEMP FILE: {str(e)}")
+        
+        return {
+            "filename": file.filename,
+            "text": extracted_text,
+            "extraction_time": extraction_time,
+            "text_length": len(extracted_text)
+        }
+        
+    except Exception as e:
+        logger.error(f"❌ ERROR EXTRACTING TEXT: {str(e)}")
+        raise HTTPException(status_code=500, detail=f"Error extracting text: {str(e)}")
+
+@router.post("/{document_id}/retry", response_model=DocumentResponse)
+async def retry_document_processing(
+    document_id: str,
+    document_processor: DocumentProcessor = Depends(get_document_processor),
+    background_tasks: BackgroundTasks = None
+):
+    """
+    Retry processing a document that previously failed.
+    
+    This endpoint attempts to reprocess a document that failed during the initial processing.
+    It will look for the original file and try to process it again.
+    """
+    logger.info(f"🔄 RETRY DOCUMENT PROCESSING REQUEST: id={document_id}")
+    
+    # First mark the document for retry
+    document = document_processor.mark_document_for_retry(document_id)
+    if not document:
+        logger.error(f"❌ DOCUMENT NOT FOUND FOR RETRY: id={document_id}")
+        raise HTTPException(status_code=404, detail=f"Document with ID {document_id} not found")
+    
+    # Start the retry process in the background
+    if background_tasks:
+        background_tasks.add_task(document_processor.retry_failed_document, document_id)
+        logger.info(f"✅ RETRY SCHEDULED IN BACKGROUND: id={document_id}")
+    else:
+        # If background_tasks is not available, create our own task
+        asyncio.create_task(document_processor.retry_failed_document(document_id))
+        logger.info(f"✅ RETRY SCHEDULED AS TASK: id={document_id}")
+    
+    return document
+
+@router.post("/recover-failed", response_model=Dict[str, Any])
+async def recover_failed_documents(
+    document_processor: DocumentProcessor = Depends(get_document_processor),
+    background_tasks: BackgroundTasks = None
+):
+    """
+    Attempt to recover all failed documents.
+    
+    This endpoint will scan for all documents with a 'failed' status and attempt to reprocess them.
+    """
+    logger.info(f"🔄 RECOVER ALL FAILED DOCUMENTS REQUEST")
+    
+    # Get all failed documents
+    failed_documents = [doc for doc in document_processor.document_store.values() if doc.status == "failed"]
+    failed_count = len(failed_documents)
+    
+    if failed_count == 0:
+        logger.info("✅ NO FAILED DOCUMENTS TO RECOVER")
+        return {"status": "success", "message": "No failed documents to recover", "count": 0}
+    
+    logger.info(f"🔄 FOUND {failed_count} FAILED DOCUMENTS TO RECOVER")
+    
+    # Start recovery in the background
+    if background_tasks:
+        background_tasks.add_task(document_processor.recover_all_failed_documents)
+        logger.info(f"✅ RECOVERY SCHEDULED IN BACKGROUND FOR {failed_count} DOCUMENTS")
+    else:
+        # If background_tasks is not available, create our own task
+        asyncio.create_task(document_processor.recover_all_failed_documents())
+        logger.info(f"✅ RECOVERY SCHEDULED AS TASK FOR {failed_count} DOCUMENTS")
+    
+    return {
+        "status": "success",
+        "message": f"Recovery started for {failed_count} failed documents",
+        "count": failed_count,
+        "document_ids": [doc.document_id for doc in failed_documents]
+    } 

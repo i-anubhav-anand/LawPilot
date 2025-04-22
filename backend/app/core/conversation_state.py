@@ -73,6 +73,23 @@ class ConversationState:
         Args:
             new_facts: Dictionary of new or updated facts
         """
+        # Log the incoming facts for debugging
+        print(f"Updating case file with new facts: {new_facts}")
+        
+        # Handle nested facts if they come with prefix keys (like fact_1, fact_2)
+        processed_facts = {}
+        for key, value in new_facts.items():
+            if key.startswith('fact_') and isinstance(value, dict):
+                # This is a nested fact from our conversion logic
+                processed_facts.update(value)
+            else:
+                # This is a regular fact
+                processed_facts[key] = value
+        
+        # If we processed any nested facts, use those instead
+        if processed_facts and len(processed_facts) > len(new_facts):
+            new_facts = processed_facts
+        
         # Update simple fields
         for field in ["role", "property_location", "problem_category", "desired_resolution"]:
             if field in new_facts and new_facts[field]:
