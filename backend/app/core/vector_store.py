@@ -42,6 +42,7 @@ class VectorStore:
         self.embeddings = []      # List of embeddings
         self.document_ids = []    # List of document IDs (parallel to embeddings)
         self.chunk_ids = []       # List of chunk IDs (parallel to embeddings)
+        self.embedding_id_to_chunk_id = {}  # Map embedding index to chunk ID
         
         # Initialize OpenAI clients
         logger.info(f"🔄 INITIALIZING OPENAI CLIENT WITH MODEL: {embedding_model_name}")
@@ -72,6 +73,14 @@ class VectorStore:
                     self.document_store = metadata["document_store"]
                     self.document_ids = metadata["document_ids"]
                     self.chunk_ids = metadata["chunk_ids"]
+                    
+                    # Load embedding_id_to_chunk_id mapping if available, or recreate it
+                    if "embedding_id_to_chunk_id" in metadata:
+                        self.embedding_id_to_chunk_id = metadata["embedding_id_to_chunk_id"]
+                    else:
+                        # Recreate mapping from chunk IDs
+                        self.embedding_id_to_chunk_id = {i: chunk_id for i, chunk_id in enumerate(self.chunk_ids)}
+                        logger.info("ℹ️ Recreated embedding_id_to_chunk_id mapping")
                 
                 logger.info(f"✅ LOADED VECTOR STORE: {len(self.document_store)} documents, {len(self.chunk_ids)} chunks, {self.index.ntotal} vectors")
             except Exception as e:
@@ -93,6 +102,7 @@ class VectorStore:
         self.index = faiss.IndexFlatL2(embedding_dim)
         self.document_ids = []
         self.chunk_ids = []
+        self.embedding_id_to_chunk_id = {}  # Reset mapping
         
         logger.info(f"✅ NEW FAISS INDEX INITIALIZED: dimension={embedding_dim}")
     
@@ -119,7 +129,8 @@ class VectorStore:
         metadata = {
             "document_store": self.document_store,
             "document_ids": self.document_ids,
-            "chunk_ids": self.chunk_ids
+            "chunk_ids": self.chunk_ids,
+            "embedding_id_to_chunk_id": self.embedding_id_to_chunk_id
         }
         
         await loop.run_in_executor(
@@ -162,6 +173,108 @@ class VectorStore:
         except Exception as e:
             logger.error(f"❌ OPENAI EMBEDDING GENERATION FAILED{chunk_info}: {str(e)}")
             raise
+            
+    async def _batch_generate_embeddings(self, chunks: List[str], chunk_ids: List[str], 
+                                         progress_callback: Optional[callable] = None) -> List[np.ndarray]:
+        """
+        Generate embeddings for multiple chunks using batched API calls.
+        This method generates embeddings for all chunks in parallel batches to maximize throughput.
+        
+        Args:
+            chunks: List of text chunks to embed
+            chunk_ids: List of chunk IDs corresponding to the chunks
+            progress_callback: Optional callback to report progress
+            
+        Returns:
+            List of embedding vectors as numpy arrays
+        """
+        if not chunks:
+            return []
+        
+        embeddings: List[np.ndarray] = []
+        total_chunks = len(chunks)
+        
+        # Log start of batch generation
+        logger.info(f"🔄 BATCH GENERATING EMBEDDINGS FOR {total_chunks} CHUNKS")
+        
+        try:
+            # Use much larger batch sizes - OpenAI supports up to 2048 items per request
+            # But we'll use 512 as a safe batch size that balances throughput and reliability
+            BATCH_SIZE = 1024
+            
+            # Create batches
+            batches = []
+            for i in range(0, total_chunks, BATCH_SIZE):
+                end_idx = min(i + BATCH_SIZE, total_chunks)
+                batches.append(chunks[i:end_idx])
+            
+            # Track which chunks map to which position for later reassembly
+            chunk_positions = {chunk_id: idx for idx, chunk_id in enumerate(chunk_ids)}
+            
+            # Process results holder
+            results = [None] * total_chunks
+            start_time = time.time()
+            
+            # Process each batch with timeout and retries
+            async def process_batch(batch_chunks, batch_start_idx):
+                batch_size = len(batch_chunks)
+                try:
+                    logger.info(f"🔄 PROCESSING EMBEDDING BATCH: {batch_size} chunks ({batch_start_idx+1}-{batch_start_idx+batch_size} of {total_chunks})")
+                    
+                    # Call OpenAI API to generate embeddings for this batch
+                    response = await self.openai_async_client.embeddings.create(
+                        input=batch_chunks,
+                        model=self.embedding_model_name
+                    )
+                    
+                    # Extract embeddings from response
+                    batch_embeddings = [np.array(item.embedding, dtype=np.float32) for item in response.data]
+                    
+                    # Report progress if callback provided
+                    if progress_callback:
+                        progress_callback(batch_size)
+                    
+                    logger.info(f"✅ BATCH EMBEDDINGS COMPLETED: {batch_size} embeddings")
+                    
+                    return batch_start_idx, batch_embeddings
+                except Exception as e:
+                    logger.error(f"❌ ERROR GENERATING EMBEDDINGS: {str(e)}")
+                    # Return empty embeddings for this batch to maintain index alignment
+                    return batch_start_idx, [np.zeros(1536, dtype=np.float32) for _ in range(batch_size)]
+            
+            # Process batches concurrently with asyncio.gather
+            batch_tasks = []
+            for i, batch in enumerate(batches):
+                # Calculate start index for this batch
+                batch_start_idx = i * BATCH_SIZE
+                # Add a small delay between batch starts to avoid rate limits
+                await asyncio.sleep(0.1)
+                # Add task to list
+                batch_tasks.append(process_batch(batch, batch_start_idx))
+            
+            # Wait for all batches to complete
+            batch_results = await asyncio.gather(*batch_tasks)
+            
+            # Process results in correct order
+            for batch_start_idx, batch_embeddings in batch_results:
+                for i, embedding in enumerate(batch_embeddings):
+                    results[batch_start_idx + i] = embedding
+            
+            # Check for any None values and replace with zeros
+            embeddings = [result if result is not None else np.zeros(1536, dtype=np.float32) for result in results]
+            
+            # Calculate and log stats
+            total_time = time.time() - start_time
+            avg_time = total_time / total_chunks if total_chunks > 0 else 0
+            
+            logger.info(f"✅ ALL EMBEDDINGS COMPLETED: {total_chunks} embeddings in {total_time:.2f}s (avg: {avg_time:.2f}s per chunk)")
+            
+            return embeddings
+        
+        except Exception as e:
+            logger.error(f"❌ ERROR IN BATCH EMBEDDING GENERATION: {str(e)}")
+            # Return empty embeddings to ensure we don't break the process
+            return [np.zeros(1536, dtype=np.float32) for _ in range(total_chunks)]
     
     async def add_document(
         self, 
@@ -170,102 +283,96 @@ class VectorStore:
         metadata: Dict[str, Any],
         progress_callback: Optional[callable] = None
     ):
-        """Add a document to the vector store
+        """
+        Add a document to the vector store.
         
         Args:
-            document_id: Unique ID for the document
-            chunks: List of text chunks from the document
-            metadata: Document metadata (title, path, etc.)
-            progress_callback: Optional callback function to report progress
+            document_id: ID of the document
+            chunks: List of text chunks to index
+            metadata: Metadata for the document
+            progress_callback: Optional callback for reporting progress
         """
-        logger.info(f"🔄 ADDING DOCUMENT: id={document_id}, chunks={len(chunks)}")
+        if not chunks:
+            logger.warning(f"⚠️ NO CHUNKS TO ADD: document_id={document_id}")
+            return
         
-        # Initialize document entry with metadata and empty chunks
-        self.document_store[document_id] = {
-            "metadata": metadata,
-            "chunks": {},
-            "added_at": datetime.now().isoformat()
-        }
+        # Generate unique IDs for each chunk
+        chunk_ids = [f"{document_id}_{i}" for i in range(len(chunks))]
         
-        # Process chunks in parallel for efficiency
-        chunk_tasks = []
-        for i, chunk_text in enumerate(chunks):
-            # Generate a unique chunk ID
-            chunk_id = str(uuid.uuid4())
-            
-            # Add chunk to document store
-            self.document_store[document_id]["chunks"][chunk_id] = {
-                "text": chunk_text,
-                "index": i
+        # Store document in document store if not already present
+        if document_id not in self.document_store:
+            self.document_store[document_id] = {
+                "metadata": metadata,
+                "chunks": {},
+                "added_at": time.time()
             }
-            
-            # Add task to generate embedding for this chunk
-            task = self._get_embedding(chunk_text, chunk_id)
-            chunk_tasks.append((chunk_id, task, i))
         
-        # Generate embeddings for all chunks, but in smaller batches to avoid blocking
-        logger.info(f"🔄 GENERATING EMBEDDINGS FOR {len(chunk_tasks)} CHUNKS")
+        total_chunks = len(chunks)
+        logger.info(f"🔄 ADDING DOCUMENT: id={document_id}, chunks={total_chunks}")
         start_time = time.time()
         
-        new_embeddings = []
-        batch_size = 5  # Process embeddings in batches of 5
-        
-        # Process chunks in batches
-        for i in range(0, len(chunk_tasks), batch_size):
-            batch = chunk_tasks[i:i+batch_size]
-            batch_results = []
+        try:
+            # Process in larger batches - 500 chunks per batch for faster overall processing
+            # This is the outer batch size for the add_document processing loop
+            PROCESSING_BATCH_SIZE = 500
+            processed_chunks = 0
             
-            # Process each batch concurrently
-            for chunk_id, task, chunk_index in batch:
-                try:
-                    embedding = await task
-                    batch_results.append((chunk_id, embedding, chunk_index))
-                except Exception as e:
-                    logger.error(f"❌ FAILED TO GENERATE EMBEDDING FOR CHUNK {chunk_id}: {str(e)}")
+            for i in range(0, total_chunks, PROCESSING_BATCH_SIZE):
+                batch_end = min(i + PROCESSING_BATCH_SIZE, total_chunks)
+                batch_size = batch_end - i
+                
+                batch_chunks = chunks[i:batch_end]
+                batch_chunk_ids = chunk_ids[i:batch_end]
+                
+                logger.info(f"🔄 PROCESSING CHUNK BATCH: {i+1}-{batch_end} of {total_chunks}")
+                
+                # Generate embeddings for this batch of chunks
+                batch_embeddings = await self._batch_generate_embeddings(
+                    batch_chunks, 
+                    batch_chunk_ids,
+                    lambda count: progress_callback(count) if progress_callback else None
+                )
+                
+                # Add to document store and index
+                for j, (chunk, chunk_id, embedding) in enumerate(zip(batch_chunks, batch_chunk_ids, batch_embeddings)):
+                    # Store chunk in document store
+                    self.document_store[document_id]["chunks"][chunk_id] = {
+                        "text": chunk,
+                        "embedding_id": len(self.chunk_ids)  # Will be the next ID
+                    }
                     
-                    # Still call progress callback on error if provided
-                    if progress_callback:
-                        progress_callback(chunk_index)
-            
-            # Process batch results
-            for chunk_id, embedding, chunk_index in batch_results:
-                # Store embedding and metadata
-                self.embeddings.append(embedding)
-                self.document_ids.append(document_id)
-                self.chunk_ids.append(chunk_id)
+                    # Add embedding to index
+                    if self.index is None:
+                        self._initialize_index()
+                    
+                    # Record mapping of chunk ID to embedding index
+                    self.embedding_id_to_chunk_id[len(self.chunk_ids)] = chunk_id
+                    self.chunk_ids.append(chunk_id)
+                    
+                    # Add embedding to FAISS index
+                    self.embeddings.append(embedding)
                 
-                new_embeddings.append(embedding)
-                
-                # Call progress callback if provided
-                if progress_callback:
-                    progress_callback(chunk_index)
+                # Add all embeddings to FAISS index at once (more efficient)
+                if batch_embeddings:
+                    batch_np_embeddings = np.array(batch_embeddings).astype(np.float32)
+                    self.index.add(batch_np_embeddings)
+                    processed_chunks += len(batch_embeddings)
+                    logger.info(f"✅ BATCH PROCESSED: {len(batch_embeddings)} chunks, index_size={len(self.chunk_ids)}")
+                    
+                    # Save the vector store after each batch to avoid data loss on large documents
+                    await self._save_data()
+                    
+                    # Short pause between batches
+                    await asyncio.sleep(0.1)
             
-            # Yield control back to the event loop after each batch
-            # This allows other requests to be processed
-            await asyncio.sleep(0.01)
-        
-        total_time = time.time() - start_time
-        avg_time = total_time / len(chunks) if chunks else 0
-        logger.info(f"✅ EMBEDDINGS COMPLETED: {len(new_embeddings)} embeddings generated in {total_time:.2f}s (avg: {avg_time:.2f}s per chunk)")
-        
-        # Add embeddings to FAISS index
-        if new_embeddings:
-            logger.info(f"🔄 UPDATING FAISS INDEX: Adding {len(new_embeddings)} embeddings")
+            total_time = time.time() - start_time
+            logger.info(f"✅ DOCUMENT ADDED: id={document_id}, chunks={total_chunks}, time={total_time:.2f}s")
             
-            # Run in executor to avoid blocking
-            loop = asyncio.get_event_loop()
-            await loop.run_in_executor(
-                None,
-                lambda: self.index.add(np.array(new_embeddings))
-            )
-            
-            # Save updated data
-            logger.info(f"🔄 SAVING VECTOR STORE DATA: {len(new_embeddings)} new embeddings")
+        except Exception as e:
+            logger.error(f"❌ ERROR ADDING DOCUMENT: {str(e)}")
+            # Save what we've got so far
             await self._save_data()
-            
-            logger.info(f"✅ DOCUMENT ADDED: id={document_id}, chunks={len(chunks)}, index_size={len(self.embeddings)}")
-        else:
-            logger.warning(f"⚠️ NO EMBEDDINGS GENERATED FOR DOCUMENT: id={document_id}")
+            raise
     
     async def search(
         self, 
@@ -335,7 +442,16 @@ class VectorStore:
                     
                 # Get document and chunk IDs
                 doc_id = self.document_ids[index]
-                chunk_id = self.chunk_ids[index]
+                
+                # Get chunk ID - use the mapping or fall back to the direct index
+                chunk_id = self.embedding_id_to_chunk_id.get(index)
+                if chunk_id is None:
+                    # Fall back to direct lookup if not in mapping
+                    if index < len(self.chunk_ids):
+                        chunk_id = self.chunk_ids[index]
+                    else:
+                        logger.warning(f"⚠️ INVALID CHUNK INDEX: {index} (max: {len(self.chunk_ids)-1})")
+                        continue
                 
                 # Skip if document doesn't exist (possibly deleted)
                 if doc_id not in self.document_store:
@@ -442,6 +558,7 @@ class VectorStore:
                 new_document_ids = []
                 new_chunk_ids = []
                 new_embeddings = []
+                new_embedding_id_to_chunk_id = {}  # Create new mapping
                 
                 for i in range(self.index.ntotal):
                     if i not in indices_to_remove:
@@ -454,8 +571,13 @@ class VectorStore:
                         
                         # Update tracking lists
                         new_document_ids.append(self.document_ids[i])
-                        new_chunk_ids.append(self.chunk_ids[i])
+                        chunk_id = self.chunk_ids[i]
+                        new_chunk_ids.append(chunk_id)
                         new_embeddings.append(vector[0])
+                        
+                        # Update mapping
+                        new_embedding_idx = len(new_chunk_ids) - 1
+                        new_embedding_id_to_chunk_id[new_embedding_idx] = chunk_id
                         
                 # Replace old index and tracking lists with new ones
                 loop = asyncio.get_event_loop()
@@ -465,6 +587,7 @@ class VectorStore:
                 self.document_ids = new_document_ids
                 self.chunk_ids = new_chunk_ids
                 self.embeddings = new_embeddings
+                self.embedding_id_to_chunk_id = new_embedding_id_to_chunk_id
                 
             # Remove document from document store
             del self.document_store[document_id]
@@ -570,6 +693,7 @@ class VectorStore:
             self.document_ids = []
             self.chunk_ids = []
             self.embeddings = []
+            self.embedding_id_to_chunk_id = {}  # Reset mapping
             
             # Save empty data
             await self._save_data()

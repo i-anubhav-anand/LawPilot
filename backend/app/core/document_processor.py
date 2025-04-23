@@ -12,6 +12,8 @@ import logging
 import asyncio
 import time
 import concurrent.futures
+import shutil
+import traceback
 
 from app.models.documents import DocumentResponse
 from app.core.vector_store import VectorStore
@@ -218,294 +220,206 @@ class DocumentProcessor:
         metadata: Optional[Dict[str, Any]] = None
     ):
         """
-        Process a document by extracting text, chunking, and storing in vector DB.
+        Process a document: extract text, chunk it, and add to vector store.
         
         Args:
             file_path: Path to the document file
-            document_id: Unique ID for the document
-            session_id: Optional session ID to associate with this document
-            case_file_id: Optional case file ID to associate with this document
+            document_id: Unique identifier for the document
+            session_id: Optional session ID to associate with document
+            case_file_id: Optional case file ID to associate with document
             is_global: Whether this document should be available to all sessions
-            metadata: Optional additional metadata about the document
-        
-        Returns:
-            None - updates are made to the document store
+            metadata: Additional metadata to store with the document
         """
-        # Create a document record
-        document = DocumentResponse(
-            document_id=document_id,
-            filename=os.path.basename(file_path),
-            session_id=session_id,
-            case_file_id=case_file_id,
-            status="processing",
-            is_global=is_global
-        )
-        
-        # Add to document store
-        self.document_store[document_id] = document
-        
-        # Save initial document metadata
-        self._save_document_metadata(document_id)
-        
         try:
-            logger.info(f"🔄 PROCESSING DOCUMENT: id={document_id}, file={file_path}")
-            self.last_processing_time = time.time()
-            self.is_processing = True
-            self.processing_document_id = document_id
+            logger.info(f"🔄 PROCESSING DOCUMENT: id={document_id}, path={file_path}")
             
-            # Initialize metadata if not provided
-            if metadata is None:
-                metadata = {}
-            
-            # Check if this is an image file that needs vision analysis
-            is_image = self._is_image_file(file_path)
-            
-            # Use vision if specified in metadata or if image and should use vision
-            use_vision = metadata.get('use_vision', False) or (is_image and self._should_use_vision(file_path))
-            
-            # Extract text from the document
-            if use_vision and is_image:
-                logger.info(f"🔄 USING VISION MODEL FOR IMAGE ANALYSIS: {file_path}")
-                vision_result = await self.vision_service.analyze_image(file_path)
-                text = vision_result.get("analysis", "")
-                
-                # If there was an error with vision analysis, fall back to OCR
-                if "error" in vision_result:
-                    logger.warning(f"⚠️ VISION ANALYSIS FAILED, FALLING BACK TO OCR: {vision_result.get('error')}")
-                    text = self._extract_text(file_path)
-            else:
-                # Use regular text extraction
-                text = self._extract_text(file_path)
-                
-            if not text or len(text.strip()) == 0:
-                logger.warning(f"⚠️ NO TEXT EXTRACTED FROM DOCUMENT: id={document_id}")
-                raise ValueError("No text could be extracted from the document")
-                
-            logger.info(f"✅ TEXT EXTRACTED: id={document_id}, length={len(text)}")
-            
-            # Chunk the text with progress reporting
-            logger.info(f"🔄 CHUNKING TEXT: document={document_id}")
-            chunk_start_time = time.time()
-            
-            # Adaptive chunk size based on document size
-            is_large_document = os.path.getsize(file_path) > 2 * (1024 * 1024)  # Consider files > 2MB as large
-            
-            # Create a special chunker instance with appropriate settings for this document
-            document_chunker = TextChunker(
-                chunk_size=300 if not is_large_document else 200, 
-                chunk_overlap=50,
-                max_chunk_time=60  # 1 minute max for chunking
-            )
-            
-            try:
-                # FIX: Properly wrap the ThreadPoolExecutor task in asyncio
-                chunking_task = self.thread_pool.submit(document_chunker.chunk_text, text)
-                # Convert the concurrent.futures.Future to an asyncio.Future
-                chunking_future = asyncio.wrap_future(chunking_task)
-                
-                # Set timeout for chunking (30 seconds + 10 seconds per MB)
-                chunking_timeout = 30 + (os.path.getsize(file_path) / (1024 * 1024) * 10)
-                chunks = await asyncio.wait_for(chunking_future, timeout=chunking_timeout)
-            except asyncio.TimeoutError:
-                logger.error(f"⚠️ CHUNKING TIMEOUT: Text chunking took longer than {chunking_timeout} seconds")
-                # If chunking times out, use emergency chunking
-                logger.info("🆘 Using emergency chunking method")
-                chunks = document_chunker._emergency_chunking(text)
-            except Exception as e:
-                logger.error(f"❌ CHUNKING ERROR: {str(e)}", exc_info=True)
-                # Fall back to emergency chunking in case of any error
-                logger.info("🆘 Using emergency chunking method due to error")
-                chunks = document_chunker._emergency_chunking(text)
-            
-            chunking_time = time.time() - chunk_start_time
-            logger.info(f"✅ TEXT CHUNKED: {len(chunks)} chunks created in {chunking_time:.2f}s")
-            
-            # Log chunk details
-            for i, chunk in enumerate(chunks):
-                if i % 10 == 0 or i == len(chunks) - 1:  # Log every 10th chunk and the last one
-                    logger.info(f"🔹 CHUNK {i+1}/{len(chunks)}: {len(chunk)} characters")
-            
-            # Yield control back to event loop
-            await asyncio.sleep(0.1)
-            
-            # For extremely large documents or too many chunks, split processing into batches
-            max_chunks_per_batch = 25  # Smaller batch size to avoid memory issues
-            if len(chunks) > max_chunks_per_batch or is_large_document:
-                logger.info(f"⚠️ DOCUMENT HAS MANY CHUNKS: {len(chunks)}. Processing in batches of {max_chunks_per_batch}")
-                
-                all_chunks = chunks
-                processed_chunks = 0
-                
-                while processed_chunks < len(all_chunks):
-                    # Process the next batch
-                    batch = all_chunks[processed_chunks:processed_chunks + max_chunks_per_batch]
-                    batch_end = min(processed_chunks + max_chunks_per_batch, len(all_chunks))
-                    logger.info(f"🔄 PROCESSING CHUNK BATCH: {processed_chunks+1}-{batch_end} of {len(all_chunks)}")
-                    
-                    # Store chunks in vector store
-                    logger.info(f"🔄 ADDING BATCH TO VECTOR STORE: chunks={len(batch)}")
-                    start_embedding_time = time.time()
-                    
-                    # Add progress report callback
-                    progress_reporter = EmbeddingProgressReporter(len(batch))
-                    
-                    try:
-                        # Set timeout for embedding generation (30 seconds + 5 seconds per chunk)
-                        embedding_timeout = 30 + (len(batch) * 5)
-                        embedding_task = self.vector_store.add_document(
-                            document_id=document_id,
-                            chunks=batch,
-                            metadata={
-                                "filename": os.path.basename(file_path),
-                                "session_id": session_id,
-                                "case_file_id": case_file_id,
-                                "batch": f"{processed_chunks+1}-{batch_end}/{len(all_chunks)}",
-                                "is_global": is_global
-                            },
-                            progress_callback=progress_reporter.report_progress
-                        )
-                        await asyncio.wait_for(embedding_task, timeout=embedding_timeout)
-                    except asyncio.TimeoutError:
-                        logger.error(f"⚠️ EMBEDDING TIMEOUT: Batch {processed_chunks+1}-{batch_end} took too long")
-                        # Continue with the next batch even if this one timed out
-                    except Exception as e:
-                        logger.error(f"⚠️ EMBEDDING ERROR: {str(e)}")
-                        # Continue with the next batch even if there was an error
-                    
-                    embedding_time = time.time() - start_embedding_time
-                    logger.info(f"✅ BATCH EMBEDDED: {len(batch)} chunks, time={embedding_time:.2f}s")
-                    
-                    # Update processed count
-                    processed_chunks += len(batch)
-                    
-                    # Allow other tasks to run - important for API responsiveness
-                    await asyncio.sleep(0.5)
-                
-                logger.info(f"✅ ALL BATCHES PROCESSED: {len(all_chunks)} chunks in total")
-            else:
-                # Process all chunks at once for smaller documents
-                # Store chunks in vector store
-                logger.info(f"🔄 ADDING DOCUMENT TO VECTOR STORE: id={document_id}, chunks={len(chunks)}")
-                start_embedding_time = time.time()
-                
-                logger.info(f"⏳ EMBEDDING GENERATION STARTING: This may take some time...")
-                
-                # Add progress report callback
-                progress_reporter = EmbeddingProgressReporter(len(chunks))
-                
-                try:
-                    # Set timeout for embedding generation (30 seconds + 2 seconds per chunk)
-                    embedding_timeout = 30 + (len(chunks) * 2)
-                    await asyncio.wait_for(
-                        self.vector_store.add_document(
-                            document_id=document_id,
-                            chunks=chunks,
-                            metadata={
-                                "filename": os.path.basename(file_path),
-                                "session_id": session_id,
-                                "case_file_id": case_file_id,
-                                "is_global": is_global
-                            },
-                            progress_callback=progress_reporter.report_progress
-                        ),
-                        timeout=embedding_timeout
-                    )
-                except asyncio.TimeoutError:
-                    logger.error(f"⚠️ EMBEDDING TIMEOUT: Embedding generation took longer than {embedding_timeout} seconds")
-                    # Continue even if embedding times out
-                
-                embedding_time = time.time() - start_embedding_time
-                logger.info(f"✅ DOCUMENT EMBEDDED: id={document_id}, time={embedding_time:.2f}s")
-            
-            # Save processed text
-            logger.info(f"🔄 SAVING PROCESSED DOCUMENT: id={document_id}")
-            processed_path = Path("processed") / f"{document_id}.json"
-            
-            processed_data = {
-                "document_id": document_id,
-                "filename": os.path.basename(file_path),
-                "text": text,
-                "chunks": chunks,
-                "session_id": session_id,
-                "case_file_id": case_file_id,
-                "processing_stats": {
-                    "text_extraction_time": time.time() - self.last_processing_time,
-                    "chunking_time": chunking_time,
-                    "embedding_time": time.time() - self.last_processing_time - chunking_time,
-                    "num_chunks": len(chunks),
-                    "total_characters": len(text)
-                }
-            }
-            
-            # Write to file in thread pool
-            await asyncio.run_in_executor(
-                self.thread_pool, 
-                lambda: json.dump(processed_data, open(processed_path, "w"))
-            )
-            
-            logger.info(f"✅ PROCESSED DOCUMENT SAVED: {processed_path}")
-            
-            # Update document status
-            self.document_store[document_id] = DocumentResponse(
+            # Get or create document record
+            document = DocumentResponse(
                 document_id=document_id,
                 filename=os.path.basename(file_path),
                 session_id=session_id,
                 case_file_id=case_file_id,
-                status="processed",
-                created_at=self.document_store[document_id].created_at,
-                processed_at=datetime.now(),
+                status="processing",
                 is_global=is_global
             )
             
-            # Save updated metadata
+            # Update document store
+            self.document_store[document_id] = document
+            
+            # Extract text from file
+            start_time = time.time()
+            
+            # Check if file exists
+            if not os.path.exists(file_path):
+                raise FileNotFoundError(f"File not found: {file_path}")
+            
+            # Check if this is an image requiring vision analysis
+            use_vision = False
+            if metadata and isinstance(metadata, dict):
+                is_image = metadata.get("is_image", False)
+                use_vision_flag = metadata.get("use_vision", False)
+                use_vision = is_image and use_vision_flag
+            
+            logger.info(f"🔄 EXTRACTING TEXT: use_vision={use_vision}")
+            
+            if use_vision:
+                # For vision processing, we'll extract text using OCR and also analyze with vision model
+                # This async function will handle both tasks
+                extracted_text = await self._process_with_vision(file_path, document_id)
+            else:
+                # For regular documents, extract text directly
+                extracted_text = self._extract_text(file_path)
+            
+            extraction_time = time.time() - start_time
+            logger.info(f"✅ TEXT EXTRACTED: {len(extracted_text)} characters in {extraction_time:.2f}s")
+            
+            # Create a copy of the file in uploads with document_id as the name
+            target_ext = os.path.splitext(file_path)[1].lower()
+            target_dir = Path("uploads")
+            target_dir.mkdir(exist_ok=True)
+            target_path = target_dir / f"{document_id}{target_ext}"
+            
+            # Only copy if not already in the target path
+            if file_path != str(target_path):
+                shutil.copy2(file_path, target_path)
+                logger.info(f"✅ FILE COPIED: {file_path} → {target_path}")
+            
+            # If this is a temporary upload, clean it up
+            if "/temp/" in file_path:
+                try:
+                    os.remove(file_path)
+                    logger.info(f"✅ TEMP FILE REMOVED: {file_path}")
+                except Exception as e:
+                    logger.warning(f"⚠️ FAILED TO REMOVE TEMP FILE: {file_path} - {str(e)}")
+            
+            # Process the extracted text
+            start_time = time.time()
+            
+            # Initialize the chunker with appropriate settings
+            # Use smaller chunks for large documents to improve retrieval precision
+            document_size = len(extracted_text)
+            
+            # Adapt chunk size for document length - smaller chunks for larger documents
+            chunk_size = 300 if document_size < 50000 else 200
+            
+            # Create the text chunker with appropriate settings
+            chunker = TextChunker(
+                chunk_size=chunk_size,
+                chunk_overlap=50,
+                max_chunk_time=30 + int(document_size / 100000) * 10  # 30s base + 10s per MB
+            )
+            
+            # Chunk the text
+            try:
+                logger.info(f"🔄 CHUNKING TEXT: size={chunk_size}, overlap=50")
+                chunks = chunker.chunk_text(extracted_text)
+                chunking_time = time.time() - start_time
+                logger.info(f"✅ TEXT CHUNKED: {len(chunks)} chunks in {chunking_time:.2f}s")
+            except Exception as e:
+                logger.error(f"❌ CHUNKING ERROR: {str(e)}")
+                logger.info(f"🔄 FALLING BACK TO EMERGENCY CHUNKING")
+                chunks = chunker._emergency_chunking(extracted_text)
+                logger.info(f"✅ EMERGENCY CHUNKING COMPLETE: {len(chunks)} chunks")
+            
+            # Initialize progress monitoring
+            progress_reporter = EmbeddingProgressReporter(len(chunks))
+            
+            # Document metadata to store
+            doc_metadata = {
+                "filename": os.path.basename(file_path),
+                "document_id": document_id,
+                "session_id": session_id,
+                "case_file_id": case_file_id,
+                "is_global": is_global,
+                "upload_time": datetime.now().isoformat(),
+                "file_type": os.path.splitext(file_path)[1].lower(),
+                "text_size": len(extracted_text),
+                "chunk_count": len(chunks)
+            }
+            
+            # Update with additional metadata if provided
+            if metadata:
+                doc_metadata.update(metadata)
+            
+            # If document has many chunks, process in batches to avoid memory issues
+            # This can happen with very large documents
+            if len(chunks) > 200:
+                logger.info(f"⚠️ DOCUMENT HAS MANY CHUNKS: {len(chunks)}. Processing in batches of 500")
+                
+                # Add document to vector store with improved batch processing
+                await self.vector_store.add_document(
+                    document_id=document_id,
+                    chunks=chunks,
+                    metadata=doc_metadata,
+                    progress_callback=progress_reporter.report_progress
+                )
+            else:
+                # For smaller documents, process all at once
+                await self.vector_store.add_document(
+                    document_id=document_id,
+                    chunks=chunks,
+                    metadata=doc_metadata,
+                    progress_callback=progress_reporter.report_progress
+                )
+            
+            # Mark document as processed
+            document.status = "processed"
+            document.processed_at = datetime.now()
+            self.document_store[document_id] = document
+            
+            # Save document metadata
             self._save_document_metadata(document_id)
             
-            total_processing_time = time.time() - self.last_processing_time
-            logger.info(f"✅ DOCUMENT PROCESSING COMPLETED: id={document_id}, total_time={total_processing_time:.2f}s")
-            
-            # If document is part of a case file, update case file
+            # If this document is part of a case file, update the case file
             if case_file_id:
                 try:
-                    from app.core.case_file_manager import CaseFileManager
+                    # Locate the case file manager
                     case_file_manager = CaseFileManager()
+                    
+                    # Update the case file with this document
                     case_file = case_file_manager.get_case_file(case_file_id)
                     if case_file:
+                        # Add document to case file's document list
                         documents = case_file.documents.copy()
                         if document_id not in documents:
                             documents.append(document_id)
-                        case_file_manager.update_case_file(case_file_id, documents=documents)
-                        logger.info(f"✅ CASE FILE UPDATED: case_file_id={case_file_id}, document_id={document_id}")
+                        
+                        # Update case file
+                        case_file_manager.update_case_file(
+                            case_file_id=case_file_id,
+                            documents=documents
+                        )
+                        logger.info(f"✅ DOCUMENT ADDED TO CASE FILE: case_file_id={case_file_id}")
+                    else:
+                        logger.warning(f"⚠️ CASE FILE NOT FOUND: case_file_id={case_file_id}")
                 except Exception as e:
-                    logger.error(f"⚠️ ERROR UPDATING CASE FILE: {str(e)}")
+                    logger.error(f"❌ FAILED TO UPDATE CASE FILE: {str(e)}")
             
-        except TimeoutError as e:
-            logger.error(f"❌ TIMEOUT ERROR PROCESSING DOCUMENT: id={document_id}, error={str(e)}")
-            # Update document with error
-            self.document_store[document_id] = DocumentResponse(
-                document_id=document_id,
-                filename=os.path.basename(file_path),
-                session_id=session_id,
-                case_file_id=case_file_id,
-                status="failed",
-                created_at=self.document_store[document_id].created_at,
-                error=f"Processing timed out: {str(e)}"
-            )
-            # Save error metadata
-            self._save_document_metadata(document_id)
+            processing_time = time.time() - start_time
+            logger.info(f"✅ DOCUMENT PROCESSED: id={document_id}, chunks={len(chunks)}, time={processing_time:.2f}s")
+            
+            return document
+            
         except Exception as e:
-            logger.error(f"❌ ERROR PROCESSING DOCUMENT: id={document_id}, error={str(e)}", exc_info=True)
-            # Update document with error
-            self.document_store[document_id] = DocumentResponse(
+            logger.error(f"❌ DOCUMENT PROCESSING FAILED: {str(e)}")
+            traceback.print_exc()
+            
+            # Update document status
+            document = DocumentResponse(
                 document_id=document_id,
                 filename=os.path.basename(file_path),
                 session_id=session_id,
                 case_file_id=case_file_id,
                 status="failed",
-                created_at=self.document_store[document_id].created_at,
-                error=str(e)
+                error=str(e),
+                is_global=is_global
             )
-            # Save error metadata
+            self.document_store[document_id] = document
+            
+            # Save metadata
             self._save_document_metadata(document_id)
+            
+            return document
     
     def _extract_text(self, file_path: str) -> str:
         """
@@ -782,4 +696,60 @@ class DocumentProcessor:
         Returns:
             True if vision analysis should be used
         """
-        return self._is_image_file(file_path) 
+        return self._is_image_file(file_path)
+
+    async def _process_with_vision(self, file_path: str, document_id: str) -> str:
+        """
+        Process an image file using both OCR and vision model analysis.
+        
+        Args:
+            file_path: Path to the image file
+            document_id: Unique ID for the document
+            
+        Returns:
+            Extracted text from the image
+        """
+        logger.info(f"🔄 PROCESSING IMAGE WITH VISION: id={document_id}")
+        
+        try:
+            # First extract text using OCR for baseline content
+            ocr_text = self._extract_from_image(file_path)
+            logger.info(f"✅ OCR TEXT EXTRACTED: {len(ocr_text)} characters")
+            
+            # Then use vision model for enhanced understanding
+            vision_prompt = """
+            Analyze this image carefully. Focus on any text content, legal documents, notices, forms, 
+            or other relevant information. Provide a detailed description of what you see, 
+            making sure to capture all text content as accurately as possible.
+            If there are any legal terms, clauses, or important information, please be extra
+            careful to reproduce them exactly.
+            """
+            
+            # Initialize vision service if not available
+            if not hasattr(self, 'vision_service'):
+                from app.core.vision_service import VisionService
+                self.vision_service = VisionService()
+            
+            # Call vision API
+            vision_result = await self.vision_service.analyze_image(
+                file_path, 
+                prompt=vision_prompt
+            )
+            
+            vision_text = vision_result.get("analysis", "")
+            logger.info(f"✅ VISION ANALYSIS COMPLETE: {len(vision_text)} characters")
+            
+            # Combine both sources, with vision analysis first (it's usually more comprehensive)
+            # If vision analysis failed, use OCR text only
+            if len(vision_text) > 50:  # Only use vision text if it's substantial
+                combined_text = f"{vision_text}\n\n--- OCR EXTRACTED TEXT ---\n\n{ocr_text}"
+            else:
+                combined_text = ocr_text
+                logger.warning(f"⚠️ VISION ANALYSIS PRODUCED LIMITED TEXT. USING OCR TEXT PRIMARILY.")
+            
+            return combined_text
+            
+        except Exception as e:
+            logger.error(f"❌ ERROR IN VISION PROCESSING: {str(e)}")
+            # Fall back to OCR-only if vision fails
+            return self._extract_from_image(file_path) 
