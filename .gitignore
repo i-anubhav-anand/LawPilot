@@ -9,7 +9,18 @@ __pycache__/
 *.so
 .Python
 build/
-
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+parts/
+sdist/
+var/
+wheels/
+*.egg-info/
+.installed.cfg
+*.egg
 
 # Virtual Environment
 venv/
@@ -37,12 +48,53 @@ backend/conversation_states/
 backend/direct_text_cache/
 
 # Frontend
+# Dependencies
 frontend/node_modules/
+frontend/src/node_modules/
+
+# Next.js build outputs
 frontend/.next/
+frontend/src/.next/
 frontend/out/
+frontend/src/out/
 frontend/.cache/
+frontend/src/.cache/
+frontend/build/
+frontend/src/build/
+frontend/dist/
+frontend/src/dist/
+
+# Testing
 frontend/coverage/
+frontend/src/coverage/
+
+# Debug logs
 frontend/npm-debug.log*
 frontend/yarn-debug.log*
 frontend/yarn-error.log*
-frontend/.pnpm-debug.log* 
+frontend/.pnpm-debug.log*
+frontend/src/npm-debug.log*
+frontend/src/yarn-debug.log*
+frontend/src/yarn-error.log*
+frontend/src/.pnpm-debug.log*
+
+# Local environment files
+frontend/.env*.local
+frontend/src/.env*.local
+
+# Vercel
+frontend/.vercel/
+frontend/src/.vercel/
+
+# Typescript
+frontend/tsconfig.tsbuildinfo
+frontend/src/tsconfig.tsbuildinfo
+
+# Important: DO NOT ignore these files - they're needed for app functionality
+# frontend/package.json
+# frontend/src/package.json
+# frontend/next-env.d.ts
+# frontend/src/next-env.d.ts
+# frontend/src/lib/
+# frontend/src/components/
+# frontend/src/app/ 

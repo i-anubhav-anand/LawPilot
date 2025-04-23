@@ -298,14 +298,23 @@ class DocumentProcessor:
             )
             
             try:
-                chunking_task = self.thread_pool.submit(lambda: document_chunker.chunk_text(text))
+                # FIX: Properly wrap the ThreadPoolExecutor task in asyncio
+                chunking_task = self.thread_pool.submit(document_chunker.chunk_text, text)
+                # Convert the concurrent.futures.Future to an asyncio.Future
+                chunking_future = asyncio.wrap_future(chunking_task)
+                
                 # Set timeout for chunking (30 seconds + 10 seconds per MB)
                 chunking_timeout = 30 + (os.path.getsize(file_path) / (1024 * 1024) * 10)
-                chunks = await asyncio.wait_for(chunking_task, timeout=chunking_timeout)
+                chunks = await asyncio.wait_for(chunking_future, timeout=chunking_timeout)
             except asyncio.TimeoutError:
                 logger.error(f"⚠️ CHUNKING TIMEOUT: Text chunking took longer than {chunking_timeout} seconds")
                 # If chunking times out, use emergency chunking
                 logger.info("🆘 Using emergency chunking method")
+                chunks = document_chunker._emergency_chunking(text)
+            except Exception as e:
+                logger.error(f"❌ CHUNKING ERROR: {str(e)}", exc_info=True)
+                # Fall back to emergency chunking in case of any error
+                logger.info("🆘 Using emergency chunking method due to error")
                 chunks = document_chunker._emergency_chunking(text)
             
             chunking_time = time.time() - chunk_start_time
