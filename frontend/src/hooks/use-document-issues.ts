@@ -1,4 +1,5 @@
-import { useState, useCallback } from 'react'
+import { useState, useCallback, useEffect } from 'react'
+import { analyzeDocument, DocumentAnalysisResponse } from '@/lib/api';
 
 export interface DocumentIssue {
   id: string
@@ -7,8 +8,42 @@ export interface DocumentIssue {
   description: string
 }
 
-export function useDocumentIssues() {
+export function useDocumentIssues(documentId?: string) {
   const [issues, setIssues] = useState<DocumentIssue[]>([])
+  const [isLoading, setIsLoading] = useState(false)
+  const [error, setError] = useState<string | null>(null)
+
+  // Fetch document issues from the API
+  useEffect(() => {
+    if (!documentId) return;
+    
+    const fetchIssues = async () => {
+      setIsLoading(true);
+      setError(null);
+      
+      try {
+        const analysis = await analyzeDocument(documentId);
+        
+        // Convert the API response format to our DocumentIssue format
+        const formattedIssues = analysis.issues.map((issue, index) => ({
+          id: `${documentId}-issue-${index}`,
+          type: issue.type,
+          title: issue.title,
+          description: issue.description
+        }));
+        
+        setIssues(formattedIssues);
+      } catch (err) {
+        console.error('Error fetching document issues:', err);
+        setError(err instanceof Error ? err.message : 'Failed to fetch document issues');
+        // Don't clear existing issues on error to maintain UI state
+      } finally {
+        setIsLoading(false);
+      }
+    };
+    
+    fetchIssues();
+  }, [documentId]);
 
   const addIssue = useCallback((issue: Omit<DocumentIssue, 'id'>) => {
     const newIssue: DocumentIssue = {
@@ -33,6 +68,8 @@ export function useDocumentIssues() {
 
   return {
     issues,
+    isLoading,
+    error,
     addIssue,
     removeIssue,
     clearIssues,

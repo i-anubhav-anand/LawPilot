@@ -50,10 +50,10 @@ def main():
         "host": host,
         "port": port,
         "log_level": "info",
-        "timeout_keep_alive": 120,  # Keep connections alive longer
-        "limit_concurrency": 100,   # Limit concurrent connections to avoid overload
-        "backlog": 2048,            # Allow more queued connections
-        "h11_max_incomplete_event_size": 5 * 1024 * 1024,  # 5MB, up from 1MB default
+        "timeout_keep_alive": 300,    # Increased from 120 to 300 seconds
+        "limit_concurrency": 100,     # Limit concurrent connections to avoid overload
+        "backlog": 2048,              # Allow more queued connections
+        "h11_max_incomplete_event_size": 10 * 1024 * 1024,  # 10MB, up from 5MB
     }
     
     if reload:

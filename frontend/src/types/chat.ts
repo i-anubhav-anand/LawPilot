@@ -6,6 +6,7 @@ export interface Message {
   timestamp?: string;
   sources?: Source[];
   isError?: boolean;
+  nextQuestions?: string[];
   fileAttachment?: {
     name: string;
     type: string;

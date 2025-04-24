@@ -6,10 +6,17 @@ import { PromptSuggestions } from "@/components/prompt-suggestions"
 import { ChatInput } from "@/components/chat-input"
 import { ChatMessage } from "./chat-message"
 import { FlipWords } from "./ui/flip-words"
-import { AlertTriangle, WifiOff } from "lucide-react"
+import { AlertTriangle, WifiOff, FileText, X } from "lucide-react"
 import { Alert, AlertDescription } from "@/components/ui/alert"
-import { sendChatMessage, getChatHistory, type Source, type ChatMessage as ChatMessageType } from "@/lib/api"
+import { 
+  sendChatMessage, 
+  getChatHistory, 
+  getSummaryFromSession,
+  type Source, 
+  type ChatMessage as ChatMessageType 
+} from "@/lib/api"
 import { DocumentIssuesFab } from "@/components/document-issues-fab"
+import { Button } from "@/components/ui/button"
 
 export function LegalChatInterface() {
   const [messages, setMessages] = useState<
@@ -29,6 +36,11 @@ export function LegalChatInterface() {
   const [activeCaseFileId, setActiveCaseFileId] = useState<string | undefined>(undefined)
   const [apiConnected, setApiConnected] = useState<boolean>(false)
   const messagesEndRef = useRef<HTMLDivElement>(null)
+  
+  // Case summary state
+  const [showSummaryPanel, setShowSummaryPanel] = useState(false)
+  const [summaryContent, setSummaryContent] = useState<string>("")
+  const [isSummaryLoading, setIsSummaryLoading] = useState(false)
 
   // Complete phrases for the FlipWords component
   const legalPhrases = [
@@ -179,11 +191,56 @@ export function LegalChatInterface() {
     handleSendMessage(question, [])
   }
 
+  // Add case file selection handler
+  const handleCaseFileSelect = (caseFileId: string) => {
+    setActiveCaseFileId(caseFileId)
+    // Reset any previous summary when changing case files
+    setSummaryContent("")
+    setShowSummaryPanel(false)
+  }
+
+  // Generate case summary from chat history
+  const generateCaseSummary = async () => {
+    if (!activeSessionId || messages.length === 0) {
+      // Show error or notification that we need messages
+      setApiError("Please send some messages before generating a summary")
+      return
+    }
+
+    setIsSummaryLoading(true)
+    setApiError(null)
+
+    try {
+      // Get the summary directly from the session
+      const response = await getSummaryFromSession(activeSessionId)
+      setSummaryContent(response.summary)
+      
+      // Show the summary panel
+      setShowSummaryPanel(true)
+    } catch (error) {
+      console.error("Error generating case summary:", error)
+      
+      if (error instanceof Error) {
+        setApiError(`Failed to generate summary: ${error.message}`)
+      } else {
+        setApiError("An unexpected error occurred generating the summary")
+      }
+    } finally {
+      setIsSummaryLoading(false)
+    }
+  }
+
   return (
     <div className="flex flex-col h-screen w-full bg-white">
       <div className="flex flex-1 overflow-hidden">
-        <Sidebar onSessionSelect={handleSessionSelect} onNewChat={handleNewChat} activeSessionId={activeSessionId} />
-        <div className="flex-1 flex flex-col h-full overflow-hidden bg-white">
+        <Sidebar 
+          onSessionSelect={handleSessionSelect} 
+          onNewChat={handleNewChat} 
+          onCaseFileSelect={handleCaseFileSelect} 
+          activeSessionId={activeSessionId}
+          activeCaseFileId={activeCaseFileId}
+        />
+        <div className="flex-1 flex flex-col h-full overflow-hidden bg-white relative">
           {/* API Connection Status */}
           {!apiConnected && (
             <div className="bg-red-50 border-b border-red-200 py-2 px-4">
@@ -271,8 +328,28 @@ export function LegalChatInterface() {
             </div>
           </div>
 
-          <div className="p-4 border-t border-gray-200">
+          <div className="p-4 border-t border-gray-200 relative">
             <div className="max-w-2xl mx-auto">
+              {/* Case Summary Button - show whenever we have messages */}
+              {activeSessionId && messages.length > 0 && (
+                <Button
+                  variant="outline"
+                  size="sm"
+                  className="absolute right-4 top-[-40px] bg-white border-gray-200 flex items-center gap-1 shadow-sm"
+                  onClick={generateCaseSummary}
+                  disabled={isSummaryLoading}
+                >
+                  {isSummaryLoading ? (
+                    <div className="h-4 w-4 border-2 border-gray-200 border-t-purple-500 rounded-full animate-spin" />
+                  ) : (
+                    <FileText size={16} className="text-purple-500" />
+                  )}
+                  <span className="text-xs font-medium">
+                    {isSummaryLoading ? "Generating..." : "Summarize Chat"}
+                  </span>
+                </Button>
+              )}
+              
               <ChatInput
                 onSendMessage={handleSendMessage}
                 isLoading={isLoading}
@@ -282,6 +359,45 @@ export function LegalChatInterface() {
               />
             </div>
           </div>
+          
+          {/* Case Summary Side Panel */}
+          {showSummaryPanel && (
+            <div className="absolute top-4 right-4 w-96 max-h-[70vh] bg-white rounded-lg border border-gray-200 shadow-lg flex flex-col z-20 overflow-hidden">
+              <div className="p-3 border-b border-gray-200 flex justify-between items-center bg-purple-50">
+                <div className="flex items-center gap-2">
+                  <FileText size={16} className="text-purple-500" />
+                  <h3 className="font-medium text-sm">Case Summary</h3>
+                </div>
+                <Button 
+                  variant="ghost" 
+                  size="sm" 
+                  className="h-7 w-7 p-0 hover:bg-purple-100" 
+                  onClick={() => setShowSummaryPanel(false)}
+                >
+                  <X size={14} />
+                </Button>
+              </div>
+              <div className="p-4 overflow-y-auto max-h-[calc(70vh-3rem)]">
+                {isSummaryLoading ? (
+                  <div className="flex flex-col items-center justify-center py-10 space-y-4">
+                    <div className="h-8 w-8 border-4 border-gray-200 border-t-purple-500 rounded-full animate-spin" />
+                    <p className="text-gray-500 text-center">
+                      Generating summary from your conversation...<br/>
+                      <span className="text-xs">This may take a few minutes for longer conversations.</span>
+                    </p>
+                  </div>
+                ) : (
+                  <div className="prose prose-sm max-w-none">
+                    {summaryContent ? (
+                      <div dangerouslySetInnerHTML={{ __html: summaryContent }} />
+                    ) : (
+                      <p className="text-gray-500 italic">No summary available yet</p>
+                    )}
+                  </div>
+                )}
+              </div>
+            </div>
+          )}
         </div>
       </div>
       

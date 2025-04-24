@@ -361,4 +361,71 @@ Based on this conversation, generate a professionally formatted case summary wit
                     
             logger.info(f"✅ UPDATED STRUCTURED SUMMARY FROM TEXT: case_file_id={case_file_id}")
         except Exception as e:
-            logger.error(f"❌ ERROR PARSING SUMMARY TEXT: case_file_id={case_file_id}, error={str(e)}") 
+            logger.error(f"❌ ERROR PARSING SUMMARY TEXT: case_file_id={case_file_id}, error={str(e)}")
+
+    async def generate_summary_text_only(self, session_id: str, chat_history: List[Dict[str, Any]]) -> Optional[str]:
+        """
+        Generate a plain text case summary from chat history without requiring or updating a case file.
+        This is used for direct chat session summarization without case file creation.
+        
+        Args:
+            session_id: ID of the chat session
+            chat_history: List of chat messages with 'role' and 'content' fields
+            
+        Returns:
+            Formatted case summary text or None if generation failed
+        """
+        try:
+            import time
+            start_time = time.time()
+            
+            # Import here to avoid circular imports
+            from app.core.llm_service import OpenAIService
+            from app.core.system_prompt import get_system_prompt
+            
+            # Initialize LLM service
+            llm_service = OpenAIService()
+            logger.info(f"🔄 STARTING SESSION SUMMARY: session_id={session_id}, message_count={len(chat_history)}")
+            
+            # Format chat history into a string
+            chat_text = []
+            for msg in chat_history:
+                role = "User" if msg.get("role") == "user" else "Assistant"
+                content = msg.get("content", "")
+                chat_text.append(f"{role}: {content}")
+            
+            conversation = "\n\n".join(chat_text)
+            logger.info(f"🔄 FORMATTED CHAT HISTORY: session_id={session_id}, length={len(conversation)}")
+            
+            # Build the prompt
+            user_prompt = f"""Please analyze this legal chat conversation and create a concise summary:
+
+CONVERSATION:
+{conversation}
+
+Based on this conversation, provide a professionally formatted summary with all relevant legal facts and key points.
+Format the summary in HTML with appropriate headings, bullet points, and sections.
+"""
+            
+            # Use the specialized case summary prompt but adjust for plain text
+            system_prompt = get_system_prompt(prompt_type="case_summary")
+            
+            # Generate the summary
+            logger.info(f"🔄 CALLING LLM FOR SESSION SUMMARY: session_id={session_id}")
+            summary_text = await llm_service.generate_response(
+                system_prompt=system_prompt,
+                user_prompt=user_prompt,
+                temperature=0.1,  # Low temperature for factual output
+                use_streaming=False
+            )
+            
+            elapsed_time = time.time() - start_time
+            logger.info(f"✅ SESSION SUMMARY GENERATED: session_id={session_id}, length={len(summary_text)}, time={elapsed_time:.2f}s")
+            
+            return summary_text
+            
+        except Exception as e:
+            logger.error(f"❌ ERROR GENERATING SESSION SUMMARY: session_id={session_id}, error={str(e)}")
+            import traceback
+            logger.error(f"❌ TRACEBACK: {traceback.format_exc()}")
+            return None 

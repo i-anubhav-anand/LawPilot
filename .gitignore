@@ -47,6 +47,10 @@ backend/documents_metadata/
 backend/conversation_states/
 backend/direct_text_cache/
 backend/vector_db/
+.backend/vector_db/
+
+
+
 # Frontend
 # Dependencies
 frontend/node_modules/

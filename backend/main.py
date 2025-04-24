@@ -35,7 +35,16 @@ for name in logging.root.manager.loggerDict:
 load_dotenv()
 logger.info("Environment variables loaded")
 
-app = FastAPI(title="Legal AI Assistant", description="AI Legal Assistant API")
+# Configure longer timeout for API operations
+# The default is 60 seconds, we'll set it to 5 minutes (300 seconds)
+OPERATION_TIMEOUT = 300.0
+
+app = FastAPI(
+    title="Legal AI Assistant", 
+    description="AI Legal Assistant API",
+    # Set longer timeout limits for API operations
+    openapi_url="/openapi.json",
+)
 
 # Configure CORS
 app.add_middleware(

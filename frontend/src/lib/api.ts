@@ -42,13 +42,30 @@ export interface DocumentResponse {
   is_global: boolean
 }
 
+export interface DocumentAnalysisResponse {
+  document_id: string;
+  summary: string;
+  key_points: string[];
+  issues: Array<{
+    type: 'warning' | 'error' | 'info';
+    title: string;
+    description: string;
+  }>;
+  recommendations: string[];
+  relevant_laws: Array<{
+    title: string;
+    description: string;
+    citation?: string;
+  }>;
+}
+
 // Export this constant so it can be used in other files
 export const API_BASE_URL = "http://localhost:8000"
 
 // Utility function to handle fetch errors
-async function fetchWithErrorHandling(url: string, options: RequestInit = {}) {
+async function fetchWithErrorHandling(url: string, options: RequestInit = {}, timeoutMs: number = 30000) {
   const controller = new AbortController()
-  const timeoutId = setTimeout(() => controller.abort(), 30000) // 30 second timeout (increased from 10 seconds)
+  const timeoutId = setTimeout(() => controller.abort(), timeoutMs) // Configurable timeout with default 30 seconds
   
   try {
     const response = await fetch(url, {
@@ -327,6 +344,13 @@ export async function getProcessingStats(): Promise<any> {
   return fetchWithErrorHandling(`${API_BASE_URL}/api/documents/processing-status`);
 }
 
+// Analyze a document to get legal issues, recommendations, and related information
+export async function analyzeDocument(documentId: string): Promise<DocumentAnalysisResponse> {
+  return fetchWithErrorHandling(`${API_BASE_URL}/api/documents/${documentId}/analyze`, {
+    method: 'POST',
+  });
+}
+
 export async function sendChatMessageWithDocumentText(
   message: string, 
   documentText: string, 
@@ -533,4 +557,41 @@ export async function sendChatMessageWithImage(
   } finally {
     clearTimeout(timeoutId);
   }
+}
+
+// Update case summary from chat history
+export async function updateCaseSummaryFromChat(
+  caseFileId: string,
+  chatHistory: any[],
+  forceUpdate: boolean = false
+): Promise<{ summary: string }> {
+  const url = `${API_BASE_URL}/api/summaries/generate/${caseFileId}`;
+  
+  return fetchWithErrorHandling(url, {
+    method: 'POST',
+      headers: {
+      'Content-Type': 'application/json',
+    },
+    body: JSON.stringify({
+      chat_history: chatHistory,
+      force_update: forceUpdate
+    }),
+  });
+}
+
+// Get formatted case summary
+export async function getFormattedCaseSummary(caseFileId: string): Promise<{ summary: string }> {
+  return fetchWithErrorHandling(`${API_BASE_URL}/api/summaries/formatted/${caseFileId}`);
+}
+
+// Add new function to get summary from session directly with extended timeout
+export async function getSummaryFromSession(
+  sessionId: string
+): Promise<{ summary: string }> {
+  // Use a longer timeout (5 minutes) for summary generation since it can be computationally intensive
+  return fetchWithErrorHandling(
+    `${API_BASE_URL}/api/summaries/from-session/${sessionId}`, 
+    {}, 
+    300000 // 5 minute timeout (300,000ms)
+  );
 }

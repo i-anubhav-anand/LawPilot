@@ -7,10 +7,18 @@ import { getChatSessions, type ChatSession } from "@/lib/api"
 interface SidebarProps {
   onSessionSelect?: (sessionId: string) => void
   onNewChat?: () => void
+  onCaseFileSelect?: (caseFileId: string) => void
   activeSessionId?: string
+  activeCaseFileId?: string
 }
 
-export function Sidebar({ onSessionSelect, onNewChat, activeSessionId }: SidebarProps) {
+export function Sidebar({ 
+  onSessionSelect, 
+  onNewChat, 
+  onCaseFileSelect,
+  activeSessionId,
+  activeCaseFileId
+}: SidebarProps) {
   const [activeItem, setActiveItem] = useState<string | null>(activeSessionId || "new-chat")
   const [expanded, setExpanded] = useState(false)
   const [chatSessions, setChatSessions] = useState<ChatSession[]>([])
