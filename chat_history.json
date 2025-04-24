@@ -1,0 +1,12 @@
+[
+  {
+    "role": "user",
+    "content": "I am a tenant in San Francisco living in a rent-controlled apartment. My landlord is trying to increase my rent by 20% which seems excessive.",
+    "timestamp": "2025-04-24T17:23:21.603383"
+  },
+  {
+    "role": "assistant",
+    "content": "I am not your lawyer and this is not legal advice. If you need tailored guidance, consult a licensed California attorney.\n\nIt sounds incredibly stressful to face such a significant rent increase. In San Francisco, rent-controlled units are generally subject to the regulations set by the San Francisco Rent Ordinance, which typically limits annual rent increases to a percentage based on the Consumer Price Index. As of the most recent updates, this increase is usually around 1-2% per year, far less than the 20% your landlord is proposing.\n\nCould you please confirm the zip code of your rental unit so I can provide more precise information? Additionally, knowing when you received the notice of the rent increase would be helpful.",
+    "timestamp": "2025-04-24T17:23:21.603383"
+  }
+]

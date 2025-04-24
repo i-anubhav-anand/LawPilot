@@ -1,0 +1,1 @@
+echo "backend/vector_db/faiss_index.bin" >> .gitignore 
