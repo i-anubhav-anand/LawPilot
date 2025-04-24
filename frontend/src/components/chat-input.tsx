@@ -2,12 +2,23 @@
 
 import type React from "react"
 import { useState, useRef, useEffect } from "react"
-import { Paperclip, ImageIcon, Send, File, FileText, X, Loader2 } from "lucide-react"
+import { Paperclip, ImageIcon, Send, File, FileText, X, Loader2, CheckCircle, AlertCircle, Info } from "lucide-react"
 import { Button } from "@/components/ui/button"
 import { LegalDisclaimer } from "./legal-disclaimer"
 import { uploadDocument, pollDocumentStatus, type DocumentResponse } from "@/lib/api"
 import { toast } from "@/components/ui/use-toast"
-import { ProcessingDialog } from "./processing-dialog"
+import { CircularProgress } from "@/components/ui/circular-progress"
+import { DISABLE_PROCESSING_DIALOGS, trackUploadProgress } from "@/lib/processing-settings"
+import { v4 as uuidv4 } from "uuid"
+
+// Add an interface for FileWithStatus to track upload progress and processing status in UI
+interface FileWithStatus {
+  file: File;
+  id?: string;
+  status: 'pending' | 'uploading' | 'processing' | 'completed' | 'error';
+  progress: number;
+  error?: string;
+}
 
 interface ChatInputProps {
   onSendMessage: (message: string, attachments: File[]) => void
@@ -28,33 +39,24 @@ export function ChatInput({
   const [charCount, setCharCount] = useState(0)
   const [showAttachMenu, setShowAttachMenu] = useState(false)
   const [showImageMenu, setShowImageMenu] = useState(false)
-  const [attachments, setAttachments] = useState<File[]>([])
-  const [uploadingFiles, setUploadingFiles] = useState<{name: string, progress?: number}[]>([])
-  const [isUploading, setIsUploading] = useState(false)
-  const [processingFiles, setProcessingFiles] = useState<DocumentResponse[]>([])
-  const [showProcessingDialog, setShowProcessingDialog] = useState(false)
-  const [processingStatus, setProcessingStatus] = useState("")
-
+  const [attachments, setAttachments] = useState<FileWithStatus[]>([])
+  const [isProcessing, setIsProcessing] = useState(false)
+  
   const fileInputRef = useRef<HTMLInputElement>(null)
   const imageInputRef = useRef<HTMLInputElement>(null)
   
   // Helper function to get overall progress
   const getOverallProgress = (): number => {
-    if (uploadingFiles.length === 0) return 0;
+    if (attachments.length === 0) return 0;
     
-    // If we have progress values, calculate average
-    const progressValues = uploadingFiles
-      .filter(f => f.progress !== undefined)
-      .map(f => f.progress || 0); // Use 0 as fallback even though we've filtered undefined
-      
+    // Calculate average progress of all files
+    const progressValues = attachments.map(f => f.progress ?? 0);
+    
     if (progressValues.length > 0) {
       return progressValues.reduce((a, b) => a + b, 0) / progressValues.length;
     }
     
-    // Otherwise calculate based on processing status
-    const processed = processingFiles.filter(f => f.status === "processed").length;
-    const totalFiles = processingFiles.length || 1; // Ensure we don't divide by zero
-    return (processed / totalFiles) * 100;
+    return 0;
   }
 
   // Add this file text extraction function
@@ -71,164 +73,101 @@ export function ChatInput({
     }
   }
 
-  // Modify the handleFileUpload function
-  const handleFileUpload = async (e: React.ChangeEvent<HTMLInputElement>) => {
-    if (e.target.files && e.target.files.length > 0) {
-      const newFiles = Array.from(e.target.files)
+  // Modified to track file attachment status better
+  const handleFileUpload = async (files: FileList) => {
+    if (files.length === 0) return;
+    
+    console.log(`📋 Preparing ${files.length} files for upload`);
+    
+    const newAttachments: FileWithStatus[] = [];
+    
+    for (let i = 0; i < files.length; i++) {
+      const file = files[i];
+      console.log(`📄 Adding file: ${file.name} (${file.type}, ${file.size} bytes)`);
       
-      // If we're uploading directly to the backend
-      if (sessionId) {
-        // Show the processing dialog
-        setShowProcessingDialog(true)
-        setIsUploading(true)
-        setUploadingFiles(newFiles.map(f => ({ name: f.name })))
-        
-        try {
-          let processedTextMessage = "";
-          
-          // First, try to extract text from text files only
-          for (let i = 0; i < newFiles.length; i++) {
-            const file = newFiles[i];
-            if (file.type.includes('text')) {
-              setProcessingStatus(`Extracting text from ${file.name}...`);
-              
-              // Extract text from file
-              const extractedText = await extractTextFromFile(file);
-              if (extractedText && extractedText.length > 0) {
-                processedTextMessage += `\n\n--- Content from ${file.name} ---\n${extractedText}`;
-              }
-            }
-          }
-          
-          // Silently process the extracted text in the background if applicable
-          if (processedTextMessage.length > 0 && input.trim().length > 0) {
-            // No UI change here - this happens silently
-            setProcessingStatus(`Processing extracted text...`);
-            
-            // Create a custom event with the extracted text
-            if (window && sessionId) {
-              const event = new CustomEvent('extracted-text-ready', {
-                detail: {
-                  text: processedTextMessage,
-                  documentName: "Extracted Text",
-                  message: input,
-                  sessionId: sessionId,
-                  caseFileId: caseFileId
-                }
-              } as CustomEventInit);
-              
-              window.dispatchEvent(event);
-            }
-          }
-          
-          // Upload files one by one for better tracking
-          const uploadedFiles: DocumentResponse[] = [];
-          
-          for (let i = 0; i < newFiles.length; i++) {
-            const file = newFiles[i];
-            setProcessingStatus(`Uploading ${file.name} (${i+1}/${newFiles.length})...`);
-            
-            // Upload the file
-            const response = await uploadDocument(file, sessionId, caseFileId);
-            uploadedFiles.push(response);
-            
-            // Update progress
-            setUploadingFiles(prev => {
-              const updated = [...prev];
-              const fileIndex = updated.findIndex(f => f.name === file.name);
-              if (fileIndex !== -1) {
-                updated[fileIndex].progress = 50; // We're halfway done with this file
-              }
-              return updated;
-            });
-            
-            // Start polling for status updates
-            setProcessingStatus(`Processing ${file.name}...`);
-            try {
-              await pollDocumentStatus(
-                response.document_id,
-                (status) => {
-                  // Update processing files
-                  setProcessingFiles(prev => {
-                    // Replace the file if it exists, otherwise add it
-                    const fileIndex = prev.findIndex(f => f.document_id === status.document_id);
-                    if (fileIndex !== -1) {
-                      const updated = [...prev];
-                      updated[fileIndex] = status;
-                      return updated;
-                    } else {
-                      return [...prev, status];
-                    }
-                  });
-                  
-                  // Update progress
-                  setUploadingFiles(prev => {
-                    const updated = [...prev];
-                    const fileIndex = updated.findIndex(f => f.name === file.name);
-                    if (fileIndex !== -1) {
-                      const progress = status.status === "processed" ? 100 : 
-                                      status.status === "failed" ? 0 : 75;
-                      updated[fileIndex].progress = progress;
-                    }
-                    return updated;
-                  });
-                  
-                  setProcessingStatus(`Processing ${file.name}: ${status.status}`);
-                }
-              );
-            } catch (e) {
-              console.warn(`Status polling failed for ${file.name}:`, e);
-              // Continue with other files even if polling fails
-            }
-          }
-          
-          // All files processed, update UI
-          setProcessingStatus("All files processed successfully");
-          setTimeout(() => {
-            setShowProcessingDialog(false);
-          }, 1500);
-          
-          // Add a message about the uploads
-          const fileNames = newFiles.map(f => f.name).join(", ");
-          const uploadMsg = `I've uploaded the following document(s): ${fileNames}`;
-          onSendMessage(uploadMsg, []);
-          
-          toast({
-            title: "Documents uploaded",
-            description: `${newFiles.length} document(s) uploaded successfully and are being processed.`,
-          });
-        } catch (error) {
-          console.error("Error uploading documents:", error);
-          setProcessingStatus("Upload failed. Please try again.");
-          
-          setTimeout(() => {
-            setShowProcessingDialog(false);
-          }, 2000);
-          
-          toast({
-            title: "Upload failed",
-            description: error instanceof Error ? error.message : "Failed to upload documents",
-            variant: "destructive"
-          });
-        } finally {
-          setTimeout(() => {
-            setIsUploading(false);
-            setUploadingFiles([]);
-            setProcessingFiles([]);
-          }, 2000);
-        }
-      } else {
-        // Just add to local attachments if no session ID
-        setAttachments((prev) => [...prev, ...newFiles]);
+      // Check file size - add a reasonable limit (e.g., 50MB)
+      const MAX_FILE_SIZE = 50 * 1024 * 1024; // 50MB
+      if (file.size > MAX_FILE_SIZE) {
+        toast({
+          title: "File too large",
+          description: `"${file.name}" exceeds the 50MB size limit.`,
+          variant: "destructive",
+          duration: 5000,
+        });
+        continue;
       }
-
-      // Close menus
-      setShowAttachMenu(false);
-      setShowImageMenu(false);
       
-      // Reset file input to allow the same file to be selected again
-      if (e.target) {
-        e.target.value = "";
+      // Check file extension for supported types
+      const fileExtension = file.name.split('.').pop()?.toLowerCase();
+      const supportedExtensions = ['pdf', 'txt', 'doc', 'docx', 'jpg', 'jpeg', 'png'];
+      
+      if (!fileExtension || !supportedExtensions.includes(fileExtension)) {
+        toast({
+          title: "Unsupported file type",
+          description: `"${file.name}" is not a supported file type. Please upload PDF, text, Word documents, or images.`,
+          variant: "destructive",
+          duration: 5000,
+        });
+        continue;
+      }
+      
+      const fileWithStatus: FileWithStatus = {
+        file,
+        id: uuidv4(),
+        status: "pending",
+        progress: 0
+      };
+      
+      newAttachments.push(fileWithStatus);
+    }
+    
+    if (newAttachments.length === 0) {
+      return; // No valid attachments to add
+    }
+    
+    setAttachments(prev => [...prev, ...newAttachments]);
+    
+    // Just mark files as ready for upload
+    for (const attachment of newAttachments) {
+      try {
+        console.log(`✅ File ready for upload: ${attachment.file.name}`);
+        
+        // Display a toast notification for better user feedback
+        toast({
+          title: "File ready",
+          description: `"${attachment.file.name}" is ready to send. Add a message and click send to process the file.`,
+          duration: 4000,
+        });
+        
+        setAttachments(prev => 
+          prev.map(att => 
+            att.id === attachment.id 
+              ? { ...att, status: "pending", progress: 100 } 
+              : att
+          )
+        );
+      } catch (error) {
+        console.error(`❌ Error preparing file ${attachment.file.name}:`, error);
+        
+        let errorMessage = "Failed to prepare file";
+        if (error instanceof Error) {
+          errorMessage = error.message;
+        }
+        
+        setAttachments(prev => 
+          prev.map(att => 
+            att.id === attachment.id 
+              ? { ...att, status: "error", error: errorMessage } 
+              : att
+          )
+        );
+        
+        toast({
+          title: "File Error",
+          description: errorMessage,
+          variant: "destructive",
+          duration: 5000,
+        });
       }
     }
   };
@@ -237,35 +176,98 @@ export function ChatInput({
     setAttachments((prev) => prev.filter((_, i) => i !== index));
   };
 
-  // Update the handleSubmit function
-  const handleSubmit = (e: React.FormEvent) => {
+  // Update the handleSubmit function to process attachments when sending
+  const handleSubmit = async (e: React.FormEvent) => {
     e.preventDefault();
-
-    if (input.trim() || attachments.length > 0) {
+    
+    // Enhanced validation for files without a message
+    if (!input.trim()) {
+      if (attachments.length > 0) {
+        // Highlight textarea with error styling
+        const textarea = document.querySelector('textarea');
+        if (textarea) {
+          textarea.classList.add('border', 'border-red-300', 'bg-red-50');
+          
+          // Remove error styling after 2 seconds
+          setTimeout(() => {
+            textarea.classList.remove('border', 'border-red-300', 'bg-red-50');
+          }, 2000);
+        }
+        
+        toast({
+          title: "Message required",
+          description: "Please add a message to send with your file attachment.",
+          variant: "destructive"
+        });
+      }
+      return;
+    }
+    
+    setIsProcessing(true);
+    
+    try {
       // Create a message that includes info about attachments if they exist
       let finalMessage = input;
+      
+      // Mark files as being processed
       if (attachments.length > 0) {
-        const fileNames = attachments.map(file => file.name).join(", ");
-        if (input.trim()) {
-          finalMessage = `${input}\n\n[Attached files: ${fileNames}]`;
-        } else {
-          finalMessage = `I've uploaded the following document(s): ${fileNames}`;
-        }
+        console.log(`Sending message with ${attachments.length} attachments`);
+        
+        setAttachments(prev => 
+          prev.map(att => ({ 
+            ...att, 
+            status: "uploading", 
+            progress: 50 
+          }))
+        );
       }
       
-      onSendMessage(finalMessage, attachments);
+      // Send all files through the onSendMessage handler
+      const filesToSend = attachments.map(a => a.file);
+      
+      // The actual API call happens in the parent component via onSendMessage
+      onSendMessage(finalMessage, filesToSend);
+      
+      // Reset state
       setInput("");
       setCharCount(0);
-      setAttachments([]);
+      
+      // Mark attachments as completed before clearing
+      setAttachments(prev => 
+        prev.map(att => ({ 
+          ...att, 
+          status: "completed", 
+          progress: 100 
+        }))
+      );
+      
+      // Clear attachments with a short delay to show completion state
+      setTimeout(() => {
+        setAttachments([]);
+      }, 500);
+      
+    } catch (error) {
+      console.error("Error sending message:", error);
+      
+      // Update attachment statuses to error
+      if (attachments.length > 0) {
+        setAttachments(prev => 
+          prev.map(att => ({ 
+            ...att, 
+            status: "error", 
+            error: "Failed to send message with attachment" 
+          }))
+        );
+      }
+      
+      toast({
+        title: "Error",
+        description: "Failed to send message. Please try again.",
+        variant: "destructive"
+      });
+    } finally {
+      setIsProcessing(false);
     }
-  };
-
-  // Cancel processing
-  const handleCancelProcessing = () => {
-    setShowProcessingDialog(false);
-    setIsUploading(false);
-    setUploadingFiles([]);
-    setProcessingFiles([]);
   };
 
   // Auto-grow textarea
@@ -277,73 +279,116 @@ export function ChatInput({
     }
   }, [input]);
 
+  // Determine if send button should be disabled
+  const sendButtonDisabled = !input.trim() || isLoading || disabled || isProcessing;
+
+  // Update the file attachment section to use CircularProgress for better status indication
+  const renderAttachments = () => {
+    if (attachments.length === 0) return null;
+
+    return (
+      <div className="flex flex-col space-y-2 mt-2">
+        {attachments.map((attachment, index) => (
+          <div
+            key={attachment.id || index}
+            className="flex items-center justify-between p-2 rounded-md bg-gray-50 border border-gray-200 text-sm"
+          >
+            <div className="flex items-center space-x-2 overflow-hidden">
+              {/* File icon based on type */}
+              <div className="flex-shrink-0">
+                {attachment.file.type.includes("image") ? (
+                  <ImageIcon className="h-4 w-4 text-gray-500" />
+                ) : (
+                  <File className="h-4 w-4 text-gray-500" />
+                )}
+              </div>
+              
+              {/* File name and status */}
+              <div className="flex flex-col min-w-0">
+                <span className="truncate font-medium" title={attachment.file.name}>
+                  {attachment.file.name}
+                </span>
+                <span className="text-xs text-gray-500">
+                  {formatFileSize(attachment.file.size)}
+                </span>
+              </div>
+            </div>
+            
+            {/* Status indicators */}
+            <div className="flex items-center space-x-2">
+              {attachment.status === 'error' && (
+                <span className="text-xs text-red-500">{attachment.error || 'Error'}</span>
+              )}
+              
+              {attachment.status === 'pending' && (
+                <span className="text-xs text-gray-500">Ready</span>
+              )}
+              
+              {attachment.status === 'uploading' && (
+                <div className="flex items-center space-x-1">
+                  <CircularProgress value={attachment.progress} size={16} />
+                  <span className="text-xs text-purple-500">Uploading</span>
+                </div>
+              )}
+              
+              {attachment.status === 'processing' && (
+                <div className="flex items-center space-x-1">
+                  <CircularProgress indeterminate size={16} />
+                  <span className="text-xs text-blue-500">Processing</span>
+                </div>
+              )}
+              
+              {attachment.status === 'completed' && (
+                <CheckCircle className="h-4 w-4 text-green-500" />
+              )}
+              
+              {/* Remove button */}
+              <button
+                type="button"
+                onClick={() => removeAttachment(index)}
+                className="text-gray-400 hover:text-red-500"
+                disabled={isProcessing || isLoading}
+              >
+                <X className="h-4 w-4" />
+              </button>
+            </div>
+          </div>
+        ))}
+      </div>
+    );
+  };
+
+  // Helper function to format file size
+  const formatFileSize = (size: number): string => {
+    if (size < 1024) {
+      return `${size} B`;
+    } else if (size < 1024 * 1024) {
+      return `${(size / 1024).toFixed(1)} KB`;
+    } else {
+      return `${(size / (1024 * 1024)).toFixed(1)} MB`;
+    }
+  };
+
   return (
     <div className="relative bg-white">
       <LegalDisclaimer />
 
-      {/* Processing Dialog */}
-      <ProcessingDialog
-        open={showProcessingDialog}
-        title="Processing Documents"
-        description="Your documents are being uploaded and processed..."
-        progress={getOverallProgress()}
-        status={processingStatus}
-        showCancel={true}
-        onCancel={handleCancelProcessing}
-      />
-
       <div className="rounded-lg border border-gray-200 bg-white overflow-hidden shadow-sm">
-        {/* Attachment preview */}
+        {/* Display file attachments with processing status */}
         {attachments.length > 0 && (
-          <div className="px-5 pt-3">
-            <div className="flex flex-wrap gap-2">
-              {attachments.map((file, index) => (
-                <div key={index} className="flex items-center bg-gray-50 rounded-md px-2 py-1 text-sm">
-                  {file.type.startsWith("image/") ? (
-                    <ImageIcon size={14} className="text-purple-500 mr-1" />
-                  ) : (
-                    <FileText size={14} className="text-purple-500 mr-1" />
-                  )}
-                  <span className="truncate max-w-[120px]">{file.name}</span>
-                  <button onClick={() => removeAttachment(index)} className="ml-1 text-gray-400 hover:text-gray-600">
-                    <X size={14} />
-                  </button>
-                </div>
-              ))}
+          <div className="px-4 pt-3 pb-1">
+            {/* Instructions banner for users */}
+            <div className="mb-2 p-2 bg-blue-50 border border-blue-100 rounded-md text-sm text-blue-700 flex items-center">
+              <Info className="h-4 w-4 mr-2 flex-shrink-0" />
+              <span>Add a message below and click send to process your {attachments.length > 1 ? 'files' : 'file'}</span>
             </div>
-            
-            <div className="flex items-center justify-between mt-2 pb-1">
-              <div className="text-xs text-purple-600 font-medium flex items-center">
-                <Paperclip size={12} className="mr-1" />
-                {attachments.length > 1 ? `${attachments.length} files attached` : '1 file attached'}
-              </div>
-            </div>
-          </div>
-        )}
-        
-        {/* File upload progress */}
-        {isUploading && uploadingFiles.length > 0 && (
-          <div className="px-5 pt-3">
-            <div className="bg-purple-50 border border-purple-100 rounded-md p-2">
-              <div className="flex items-center text-sm text-purple-600">
-                <Loader2 size={14} className="mr-2 animate-spin" />
-                <span>Uploading {uploadingFiles.length} file(s)...</span>
-              </div>
-              <div className="mt-1 text-xs text-purple-500">
-                {uploadingFiles.slice(0, 3).map((file, i) => (
-                  <div key={i} className="truncate max-w-[300px]">{file.name}</div>
-                ))}
-                {uploadingFiles.length > 3 && (
-                  <div>and {uploadingFiles.length - 3} more...</div>
-                )}
-              </div>
-            </div>
+            {renderAttachments()}
           </div>
         )}
 
         <form onSubmit={handleSubmit}>
           <textarea
-            placeholder="Ask whatever you want...."
+            placeholder={attachments.length > 0 ? "Type a message to send with your attachment..." : "Ask whatever you want...."}
             className="w-full px-5 pt-4 pb-12 resize-none focus:outline-none min-h-[80px] max-h-[200px] font-normal text-base"
             value={input}
             onChange={(e) => {
@@ -352,7 +397,7 @@ export function ChatInput({
               setCharCount(value.length);
             }}
             maxLength={1000}
-            disabled={disabled || isUploading}
+            disabled={disabled || isProcessing}
             style={{ overflow: 'hidden' }}
           />
 
@@ -363,15 +408,15 @@ export function ChatInput({
                 <button
                   type="button"
                   className={`p-1.5 rounded-md hover:bg-gray-100 transition-colors ${
-                    disabled || isUploading ? "opacity-50 cursor-not-allowed" : ""
+                    disabled || isProcessing ? "opacity-50 cursor-not-allowed" : ""
                   } ${attachments.length > 0 ? "bg-purple-100 text-purple-600" : ""}`}
                   onClick={() => {
-                    if (!disabled && !isUploading) {
+                    if (!disabled && !isProcessing) {
                       setShowAttachMenu(!showAttachMenu)
                       setShowImageMenu(false)
                     }
                   }}
-                  disabled={disabled || isUploading}
+                  disabled={disabled || isProcessing}
                   aria-label="Attach file"
                   title="Attach file"
                 >
@@ -388,7 +433,16 @@ export function ChatInput({
                   type="file" 
                   ref={fileInputRef} 
                   className="hidden" 
-                  onChange={handleFileUpload} 
+                  onChange={(e) => {
+                    if (e.target.files && e.target.files.length > 0) {
+                      console.log(`File selected: ${e.target.files[0].name}, size: ${e.target.files[0].size}, type: ${e.target.files[0].type}`);
+                      handleFileUpload(e.target.files);
+                      // Close menu after selection
+                      setShowAttachMenu(false);
+                      // Focus on textarea for user to add a message
+                      document.querySelector('textarea')?.focus();
+                    }
+                  }}
                   accept=".pdf,.txt,.docx,.doc"
                   multiple 
                 />
@@ -415,15 +469,15 @@ export function ChatInput({
                 <button
                   type="button"
                   className={`p-1.5 rounded-md hover:bg-gray-100 transition-colors ${
-                    disabled || isUploading ? "opacity-50 cursor-not-allowed" : ""
-                  } ${attachments.some(file => file.type.startsWith("image/")) ? "bg-purple-100 text-purple-600" : ""}`}
+                    disabled || isProcessing ? "opacity-50 cursor-not-allowed" : ""
+                  } ${attachments.some(a => a.file.type.startsWith("image/")) ? "bg-purple-100 text-purple-600" : ""}`}
                   onClick={() => {
-                    if (!disabled && !isUploading) {
+                    if (!disabled && !isProcessing) {
                       setShowImageMenu(!showImageMenu)
                       setShowAttachMenu(false)
                     }
                   }}
-                  disabled={disabled || isUploading}
+                  disabled={disabled || isProcessing}
                   aria-label="Attach image"
                   title="Attach image"
                 >
@@ -436,7 +490,16 @@ export function ChatInput({
                   ref={imageInputRef}
                   className="hidden"
                   accept="image/*"
-                  onChange={handleFileUpload}
+                  onChange={(e) => {
+                    if (e.target.files && e.target.files.length > 0) {
+                      console.log(`Image selected: ${e.target.files[0].name}, size: ${e.target.files[0].size}, type: ${e.target.files[0].type}`);
+                      handleFileUpload(e.target.files);
+                      // Close menu after selection
+                      setShowImageMenu(false);
+                      // Focus on textarea for user to add a message
+                      document.querySelector('textarea')?.focus();
+                    }
+                  }}
                   multiple
                 />
 
@@ -459,47 +522,29 @@ export function ChatInput({
             </div>
 
             <div className="flex items-center gap-3">
-              <div className="flex items-center gap-2">
-                <span className="text-xs text-gray-500">{charCount}/1000</span>
-                <div className="relative">
-                  <Button
-                    type="button"
-                    variant="outline"
-                    size="sm"
-                    className="text-xs border-gray-200 font-normal h-7 px-2.5"
-                    disabled={disabled || isUploading}
-                  >
-                    AI Web
-                    <svg
-                      className="ml-1 h-3 w-3 text-gray-500"
-                      fill="none"
-                      height="24"
-                      stroke="currentColor"
-                      strokeLinecap="round"
-                      strokeLinejoin="round"
-                      strokeWidth="2"
-                      viewBox="0 0 24 24"
-                      width="24"
-                    >
-                      <path d="m6 9 6 6 6-6"></path>
-                    </svg>
-                  </Button>
-                </div>
+              <div className="text-xs text-gray-400">
+                {charCount}/1000
               </div>
-
-              <Button
-                type="submit"
-                size="icon"
-                className="rounded-md bg-purple-500 hover:bg-purple-600 text-white h-7 w-7"
-                disabled={(!input.trim() && attachments.length === 0) || isLoading || disabled || isUploading}
-              >
-                {isLoading || isUploading ? (
-                  <div className="h-3.5 w-3.5 border-2 border-white border-t-transparent rounded-full animate-spin" />
-                ) : (
-                  <Send className="h-3.5 w-3.5" />
-                )}
-              </Button>
             </div>
+            
+            <Button 
+              type="submit" 
+              size="sm" 
+              disabled={sendButtonDisabled}
+              className={`rounded-full px-3 py-1.5 ${
+                attachments.length > 0 && input.trim() 
+                  ? 'bg-purple-600 hover:bg-purple-700 text-white border-purple-600' 
+                  : ''
+              }`}
+              title={!input.trim() && attachments.length > 0 ? "Please enter a message to send with your files" : ""}
+            >
+              {isLoading || isProcessing ? (
+                <div className="h-4 w-4 border-2 border-current border-t-transparent rounded-full animate-spin mr-1" />
+              ) : (
+                <Send className={`h-4 w-4 ${attachments.length > 0 && input.trim() ? 'mr-1' : ''}`} />
+              )}
+              {attachments.length > 0 && input.trim() && <span>Send file{attachments.length > 1 ? 's' : ''}</span>}
+            </Button>
           </div>
         </form>
       </div>

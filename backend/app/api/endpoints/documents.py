@@ -11,17 +11,21 @@ import asyncio
 from app.core.document_processor import DocumentProcessor
 from app.core.rag_engine import RAGEngine
 from app.models.documents import DocumentResponse, DocumentAnalysisResponse
-from app.api.deps import get_document_processor
+from app.api.deps import get_document_processor, get_rag_engine
 
 # Set up logging
 logger = logging.getLogger("documents_api")
 
 router = APIRouter()
-document_processor = DocumentProcessor()
-rag_engine = RAGEngine()
+# Remove global document_processor and rag_engine instances
+# document_processor = DocumentProcessor()
+# rag_engine = RAGEngine()
 
 @router.get("/", response_model=List[DocumentResponse])
-async def list_documents(session_id: Optional[str] = None):
+async def list_documents(
+    session_id: Optional[str] = None,
+    document_processor: DocumentProcessor = Depends(get_document_processor)
+):
     """
     List all documents and their processing status.
     Optionally filter by session ID.
@@ -42,30 +46,27 @@ async def upload_document(
     session_id: Optional[str] = Form(None),
     case_file_id: Optional[str] = Form(None),
     background_tasks: BackgroundTasks = None,
-    use_vision: bool = Form(True)  # Add a flag to control vision analysis
+    use_vision: bool = Form(True),  # Add a flag to control vision analysis
+    document_processor: DocumentProcessor = Depends(get_document_processor)
 ):
     """
-    Upload a document for processing and analysis.
+    Upload a document for processing.
     
-    For image files, the system will automatically use vision analysis
-    if the use_vision flag is set to True (default).
+    This endpoint allows uploading documents like PDFs, text files, Word docs, and images.
+    The document will be processed in the background and made available for RAG.
     """
-    logger.info(f"📤 DOCUMENT UPLOAD: filename={file.filename}, session_id={session_id}, use_vision={use_vision}")
+    logger.info(f"📤 DOCUMENT UPLOAD: filename={file.filename}, session_id={session_id}, case_file_id={case_file_id}")
     
-    # Generate IDs if not provided
-    session_id = session_id or str(uuid.uuid4())
+    # Generate document ID
     document_id = str(uuid.uuid4())
     
     # Save the uploaded file
     file_extension = Path(file.filename).suffix.lower()
-    allowed_extensions = ['.pdf', '.txt', '.docx', '.doc', '.jpg', '.jpeg', '.png', '.gif', '.webp']
+    allowed_extensions = ['.pdf', '.txt', '.docx', '.doc', '.jpg', '.jpeg', '.png']
     
     if file_extension not in allowed_extensions:
         logger.warning(f"❌ UNSUPPORTED FILE FORMAT: {file_extension}")
         raise HTTPException(status_code=400, detail="Unsupported file format")
-    
-    # Check if this is an image file
-    is_image = file_extension in ['.jpg', '.jpeg', '.png', '.gif', '.webp']
     
     # Create uploads directory if it doesn't exist
     upload_dir = Path("uploads")
@@ -79,13 +80,17 @@ async def upload_document(
     
     logger.info(f"✅ FILE SAVED: path={file_path}")
     
+    # Check if this is an image
+    is_image = file_extension.lower() in ['.jpg', '.jpeg', '.png']
+    logger.info(f"📝 FILE INFO: is_image={is_image}, use_vision={use_vision}")
+    
     # Process document in background
-    logger.info(f"🔄 STARTING BACKGROUND DOCUMENT PROCESSING: id={document_id}, is_image={is_image}, use_vision={use_vision}")
+    logger.info(f"🔄 STARTING BACKGROUND DOCUMENT PROCESSING: id={document_id}")
     
     # Wrap async function for background tasks
     async def process_document_wrapper():
-        # Initialize a document processor
-        doc_processor = DocumentProcessor()
+        # Initialize async components if needed
+        await document_processor.async_initialize()
         
         # For image files, we add a special metadata flag for vision analysis
         metadata = {
@@ -93,7 +98,7 @@ async def upload_document(
             "use_vision": use_vision and is_image
         }
         
-        await doc_processor.process_document(
+        await document_processor.process_document(
             str(file_path),
             document_id,
             session_id,
@@ -113,51 +118,10 @@ async def upload_document(
         status="processing"
     )
 
-@router.get("/{document_id}", response_model=DocumentResponse)
-async def get_document_status(document_id: str):
-    """
-    Get the status of a processed document.
-    """
-    logger.info(f"🔍 GET DOCUMENT STATUS: id={document_id}")
-    document = document_processor.get_document(document_id)
-    if not document:
-        logger.warning(f"❌ DOCUMENT NOT FOUND: id={document_id}")
-        raise HTTPException(status_code=404, detail="Document not found")
-    
-    logger.info(f"✅ DOCUMENT STATUS: id={document_id}, status={document.status}")
-    return document
-
-@router.post("/{document_id}/analyze", response_model=DocumentAnalysisResponse)
-async def analyze_document(document_id: str):
-    """
-    Analyze a document for legal issues and extract relevant information.
-    """
-    logger.info(f"🔍 ANALYZE DOCUMENT: id={document_id}")
-    document = document_processor.get_document(document_id)
-    if not document:
-        logger.warning(f"❌ DOCUMENT NOT FOUND: id={document_id}")
-        raise HTTPException(status_code=404, detail="Document not found")
-    
-    if document.status != "processed":
-        logger.warning(f"❌ DOCUMENT NOT PROCESSED: id={document_id}, status={document.status}")
-        raise HTTPException(status_code=400, detail="Document is still processing")
-    
-    # Analyze the document using RAG
-    logger.info(f"🔄 STARTING DOCUMENT ANALYSIS: id={document_id}")
-    analysis = await rag_engine.analyze_document(document_id)
-    logger.info(f"✅ DOCUMENT ANALYSIS COMPLETED: id={document_id}")
-    
-    return DocumentAnalysisResponse(
-        document_id=document_id,
-        summary=analysis.summary,
-        key_points=analysis.key_points,
-        issues=analysis.issues,
-        recommendations=analysis.recommendations,
-        relevant_laws=analysis.relevant_laws
-    )
-
 @router.get("/processing-status", response_model=Dict[str, Any])
-async def document_processing_status():
+async def document_processing_status(
+    document_processor: DocumentProcessor = Depends(get_document_processor)
+):
     """
     Get the current document processing status including stats.
     """
@@ -212,7 +176,8 @@ async def document_processing_status():
 @router.post("/upload/global", response_model=DocumentResponse)
 async def upload_global_document(
     file: UploadFile = File(...),
-    background_tasks: BackgroundTasks = None
+    background_tasks: BackgroundTasks = None,
+    document_processor: DocumentProcessor = Depends(get_document_processor)
 ):
     """
     Upload a document to the global RAG knowledge base.
@@ -249,8 +214,12 @@ async def upload_global_document(
     # Process document in background
     logger.info(f"🔄 STARTING BACKGROUND GLOBAL DOCUMENT PROCESSING: id={document_id}")
     
-    # Wrap async function for background tasks
+    # Wrap async function for background tasks - use the existing document_processor instance
     async def process_global_document_wrapper():
+        # Initialize async components if needed
+        await document_processor.async_initialize()
+        
+        # Process the document
         await document_processor.process_document(
             str(file_path),
             document_id,
@@ -269,7 +238,9 @@ async def upload_global_document(
     )
 
 @router.get("/global", response_model=List[DocumentResponse])
-async def list_global_documents():
+async def list_global_documents(
+    document_processor: DocumentProcessor = Depends(get_document_processor)
+):
     """
     List all global documents and their processing status.
     These are documents available to all chat sessions.
@@ -283,9 +254,60 @@ async def list_global_documents():
     logger.info(f"✅ RETURNED {len(global_docs)} GLOBAL DOCUMENTS")
     return global_docs
 
+@router.get("/{document_id}", response_model=DocumentResponse)
+async def get_document_status(
+    document_id: str,
+    document_processor: DocumentProcessor = Depends(get_document_processor)
+):
+    """
+    Get the status of a processed document.
+    """
+    logger.info(f"🔍 GET DOCUMENT STATUS: id={document_id}")
+    document = document_processor.get_document(document_id)
+    if not document:
+        logger.warning(f"❌ DOCUMENT NOT FOUND: id={document_id}")
+        raise HTTPException(status_code=404, detail="Document not found")
+    
+    logger.info(f"✅ DOCUMENT STATUS: id={document_id}, status={document.status}")
+    return document
+
+@router.post("/{document_id}/analyze", response_model=DocumentAnalysisResponse)
+async def analyze_document(
+    document_id: str,
+    document_processor: DocumentProcessor = Depends(get_document_processor),
+    rag_engine: RAGEngine = Depends(get_rag_engine)
+):
+    """
+    Analyze a document for legal issues and extract relevant information.
+    """
+    logger.info(f"🔍 ANALYZE DOCUMENT: id={document_id}")
+    document = document_processor.get_document(document_id)
+    if not document:
+        logger.warning(f"❌ DOCUMENT NOT FOUND: id={document_id}")
+        raise HTTPException(status_code=404, detail="Document not found")
+    
+    if document.status != "processed":
+        logger.warning(f"❌ DOCUMENT NOT PROCESSED: id={document_id}, status={document.status}")
+        raise HTTPException(status_code=400, detail="Document is still processing")
+    
+    # Analyze the document using RAG
+    logger.info(f"🔄 STARTING DOCUMENT ANALYSIS: id={document_id}")
+    analysis = await rag_engine.analyze_document(document_id)
+    logger.info(f"✅ DOCUMENT ANALYSIS COMPLETED: id={document_id}")
+    
+    return DocumentAnalysisResponse(
+        document_id=document_id,
+        summary=analysis.summary,
+        key_points=analysis.key_points,
+        issues=analysis.issues,
+        recommendations=analysis.recommendations,
+        relevant_laws=analysis.relevant_laws
+    )
+
 @router.post("/{document_id}/toggle-global", response_model=DocumentResponse)
 async def toggle_document_global_status(
-    document_id: str
+    document_id: str,
+    document_processor: DocumentProcessor = Depends(get_document_processor)
 ):
     """
     Toggle a document's global status (make it available to all sessions or restrict it).
@@ -377,26 +399,8 @@ async def extract_document_text(
         # Use the document processor to extract text
         start_time = time.time()
         
-        # Run extraction in thread pool to avoid blocking
-        loop = asyncio.get_event_loop()
-        extraction_task = loop.run_in_executor(
-            None, 
-            lambda: document_processor._extract_text(str(temp_file_path))
-        )
-        
-        # Set a timeout for text extraction (30 seconds + 5 seconds per MB)
-        file_size = os.path.getsize(temp_file_path)
-        file_size_mb = file_size / (1024 * 1024)
-        extraction_timeout = 30 + (file_size_mb * 5)
-        
-        try:
-            extracted_text = await asyncio.wait_for(extraction_task, timeout=extraction_timeout)
-        except asyncio.TimeoutError:
-            logger.error(f"⚠️ TEXT EXTRACTION TIMEOUT: Took longer than {extraction_timeout}s")
-            raise HTTPException(
-                status_code=500,
-                detail=f"Text extraction timed out after {extraction_timeout} seconds"
-            )
+        # Call the extraction method directly - this method is synchronous and safe
+        extracted_text = document_processor._extract_text(str(temp_file_path))
         
         extraction_time = time.time() - start_time
         logger.info(f"✅ TEXT EXTRACTED: {len(extracted_text)} characters in {extraction_time:.2f}s")
@@ -417,6 +421,8 @@ async def extract_document_text(
         
     except Exception as e:
         logger.error(f"❌ ERROR EXTRACTING TEXT: {str(e)}")
+        import traceback
+        traceback.print_exc()
         raise HTTPException(status_code=500, detail=f"Error extracting text: {str(e)}")
 
 @router.post("/{document_id}/retry", response_model=DocumentResponse)
@@ -426,29 +432,32 @@ async def retry_document_processing(
     background_tasks: BackgroundTasks = None
 ):
     """
-    Retry processing a document that previously failed.
-    
-    This endpoint attempts to reprocess a document that failed during the initial processing.
-    It will look for the original file and try to process it again.
+    Retry processing a failed document. Useful when document failed processing for transient reasons.
     """
-    logger.info(f"🔄 RETRY DOCUMENT PROCESSING REQUEST: id={document_id}")
+    logger.info(f"🔄 RETRY DOCUMENT PROCESSING: id={document_id}")
     
-    # First mark the document for retry
-    document = document_processor.mark_document_for_retry(document_id)
+    # Check if document exists
+    document = document_processor.get_document(document_id)
     if not document:
-        logger.error(f"❌ DOCUMENT NOT FOUND FOR RETRY: id={document_id}")
-        raise HTTPException(status_code=404, detail=f"Document with ID {document_id} not found")
+        logger.warning(f"❌ DOCUMENT NOT FOUND: id={document_id}")
+        raise HTTPException(status_code=404, detail="Document not found")
     
-    # Start the retry process in the background
-    if background_tasks:
-        background_tasks.add_task(document_processor.retry_failed_document, document_id)
-        logger.info(f"✅ RETRY SCHEDULED IN BACKGROUND: id={document_id}")
-    else:
-        # If background_tasks is not available, create our own task
-        asyncio.create_task(document_processor.retry_failed_document(document_id))
-        logger.info(f"✅ RETRY SCHEDULED AS TASK: id={document_id}")
+    # Mark document for retry
+    document_processor.mark_document_for_retry(document_id)
     
-    return document
+    # Retry processing in background
+    async def retry_wrapper():
+        # Initialize async components if needed
+        await document_processor.async_initialize()
+        
+        # Retry processing
+        await document_processor.retry_failed_document(document_id)
+    
+    background_tasks.add_task(retry_wrapper)
+    
+    logger.info(f"✅ DOCUMENT RETRY QUEUED: id={document_id}")
+    
+    return document_processor.get_document(document_id)
 
 @router.post("/recover-failed", response_model=Dict[str, Any])
 async def recover_failed_documents(
@@ -486,4 +495,49 @@ async def recover_failed_documents(
         "message": f"Recovery started for {failed_count} failed documents",
         "count": failed_count,
         "document_ids": [doc.document_id for doc in failed_documents]
-    } 
+    }
+
+@router.delete("/{document_id}", response_model=Dict[str, str])
+async def delete_document(
+    document_id: str,
+    document_processor: DocumentProcessor = Depends(get_document_processor)
+):
+    """
+    Delete a document from the system.
+    This removes the document from both the document store and vector store.
+    """
+    logger.info(f"🔄 DELETE DOCUMENT REQUEST: id={document_id}")
+    
+    # Initialize async components
+    await document_processor.async_initialize()
+    
+    # Check if document exists
+    document = document_processor.get_document(document_id)
+    if not document:
+        logger.warning(f"❌ DOCUMENT NOT FOUND: id={document_id}")
+        raise HTTPException(status_code=404, detail="Document not found")
+    
+    try:
+        # Delete from vector store first
+        vector_store_deleted = await document_processor.vector_store.delete_document(document_id)
+        
+        if not vector_store_deleted:
+            logger.warning(f"⚠️ DOCUMENT NOT FOUND IN VECTOR STORE: id={document_id}")
+        
+        # Remove metadata file
+        metadata_path = Path("documents_metadata") / f"{document_id}.json"
+        if metadata_path.exists():
+            metadata_path.unlink()
+            logger.info(f"✅ DOCUMENT METADATA DELETED: id={document_id}")
+        
+        # Remove from document store
+        if document_id in document_processor.document_store:
+            del document_processor.document_store[document_id]
+            logger.info(f"✅ DOCUMENT REMOVED FROM DOCUMENT STORE: id={document_id}")
+        
+        logger.info(f"✅ DOCUMENT DELETED SUCCESSFULLY: id={document_id}")
+        return {"status": "deleted"}
+        
+    except Exception as e:
+        logger.error(f"❌ ERROR DELETING DOCUMENT: id={document_id}, error={str(e)}")
+        raise HTTPException(status_code=500, detail=f"Error deleting document: {str(e)}") 

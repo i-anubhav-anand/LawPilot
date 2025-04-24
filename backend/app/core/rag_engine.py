@@ -103,6 +103,37 @@ class RAGEngine:
         # Return all session IDs
         return list(self.chat_histories.keys())
     
+    def delete_chat_session(self, session_id: str) -> bool:
+        """
+        Delete a chat session and its associated files.
+        
+        Args:
+            session_id: The ID of the session to delete.
+            
+        Returns:
+            True if deleted successfully, False if the session doesn't exist.
+        """
+        if session_id not in self.chat_histories:
+            return False
+            
+        # Remove from memory
+        self.chat_histories.pop(session_id, None)
+        self.conversation_states.pop(session_id, None)
+        
+        # Remove files from disk
+        history_file = Path("chat_histories") / f"{session_id}.json"
+        state_file = Path("conversation_states") / f"{session_id}.json"
+        
+        try:
+            if history_file.exists():
+                history_file.unlink()
+            if state_file.exists():
+                state_file.unlink()
+            return True
+        except Exception as e:
+            logger.error(f"Error deleting chat session {session_id}: {e}")
+            return False
+    
     def _get_conversation_state(self, session_id: str) -> ConversationState:
         """
         Get or create a conversation state for a session.

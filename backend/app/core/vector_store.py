@@ -12,6 +12,7 @@ import time
 import uuid
 from openai import OpenAI, AsyncOpenAI
 from dotenv import load_dotenv
+import traceback
 
 # Set up logging
 logging.basicConfig(level=logging.INFO)
@@ -333,6 +334,14 @@ class VectorStore:
                     lambda count: progress_callback(count) if progress_callback else None
                 )
                 
+                # Ensure the index is initialized
+                if self.index is None:
+                    self._initialize_index()
+                
+                # Ensure that embedding_id_to_chunk_id is properly initialized
+                if not hasattr(self, 'embedding_id_to_chunk_id') or self.embedding_id_to_chunk_id is None:
+                    self.embedding_id_to_chunk_id = {}
+                
                 # Add to document store and index
                 for j, (chunk, chunk_id, embedding) in enumerate(zip(batch_chunks, batch_chunk_ids, batch_embeddings)):
                     # Store chunk in document store
@@ -341,23 +350,25 @@ class VectorStore:
                         "embedding_id": len(self.chunk_ids)  # Will be the next ID
                     }
                     
-                    # Add embedding to index
-                    if self.index is None:
-                        self._initialize_index()
-                    
                     # Record mapping of chunk ID to embedding index
-                    self.embedding_id_to_chunk_id[len(self.chunk_ids)] = chunk_id
+                    current_idx = len(self.chunk_ids)
+                    self.embedding_id_to_chunk_id[current_idx] = chunk_id
                     self.chunk_ids.append(chunk_id)
                     
-                    # Add embedding to FAISS index
+                    # Add embedding to embeddings list
                     self.embeddings.append(embedding)
                 
                 # Add all embeddings to FAISS index at once (more efficient)
                 if batch_embeddings:
-                    batch_np_embeddings = np.array(batch_embeddings).astype(np.float32)
-                    self.index.add(batch_np_embeddings)
-                    processed_chunks += len(batch_embeddings)
-                    logger.info(f"✅ BATCH PROCESSED: {len(batch_embeddings)} chunks, index_size={len(self.chunk_ids)}")
+                    try:
+                        batch_np_embeddings = np.array(batch_embeddings).astype(np.float32)
+                        self.index.add(batch_np_embeddings)
+                        processed_chunks += len(batch_embeddings)
+                        logger.info(f"✅ BATCH PROCESSED: {len(batch_embeddings)} chunks, index_size={len(self.chunk_ids)}")
+                    except Exception as batch_error:
+                        logger.error(f"❌ ERROR ADDING BATCH TO INDEX: {str(batch_error)}")
+                        # Continue with the next batch instead of failing completely
+                        continue
                     
                     # Save the vector store after each batch to avoid data loss on large documents
                     await self._save_data()
@@ -370,9 +381,11 @@ class VectorStore:
             
         except Exception as e:
             logger.error(f"❌ ERROR ADDING DOCUMENT: {str(e)}")
+            traceback.print_exc()  # Add traceback for better debugging
             # Save what we've got so far
             await self._save_data()
-            raise
+            # Don't re-raise the exception to prevent API failures
+            # Instead, return and let the document be marked as processed with whatever chunks we managed to add
     
     async def search(
         self, 

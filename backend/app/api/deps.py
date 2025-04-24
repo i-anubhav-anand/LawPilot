@@ -30,6 +30,9 @@ def get_document_processor() -> DocumentProcessor:
     """
     Returns a singleton instance of the Document Processor.
     This ensures we reuse the same processor instance across requests.
+    
+    Note: For async operations that need vector store access, you should call
+    await document_processor.async_initialize() after getting the instance.
     """
     return DocumentProcessor()
 

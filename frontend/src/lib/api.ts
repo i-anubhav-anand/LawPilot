@@ -21,6 +21,7 @@ export interface ChatResponse {
   case_file_id?: string | null
   sources?: Source[]
   next_questions?: string[]
+  uploaded_document_id?: string
 }
 
 export interface ChatSession {
@@ -41,7 +42,8 @@ export interface DocumentResponse {
   is_global: boolean
 }
 
-const API_BASE_URL = "http://localhost:8000"
+// Export this constant so it can be used in other files
+export const API_BASE_URL = "http://localhost:8000"
 
 // Utility function to handle fetch errors
 async function fetchWithErrorHandling(url: string, options: RequestInit = {}) {
@@ -127,7 +129,7 @@ export async function getChatHistory(sessionId: string): Promise<ChatMessage[]> 
 
 // Get a specific session
 export async function getSession(sessionId: string): Promise<ChatSession> {
-  return fetchWithErrorHandling(`${API_BASE_URL}/api/chat/session/${sessionId}/`)
+  return fetchWithErrorHandling(`${API_BASE_URL}/api/chat/sessions/${sessionId}`)
 }
 
 // Get all chat sessions
@@ -206,7 +208,16 @@ export async function uploadDocument(
 
 // Get document status
 export async function getDocumentStatus(documentId: string): Promise<DocumentResponse> {
+  // Make sure we're not trying to get status for "list" or other special paths
+  if (documentId === 'list' || documentId === 'global' || documentId === 'processing-status') {
+    throw new Error(`Invalid document ID: ${documentId}`);
+  }
   return fetchWithErrorHandling(`${API_BASE_URL}/api/documents/${documentId}`)
+}
+
+// Get the download URL for a document
+export function getDocumentDownloadUrl(documentId: string): string {
+  return `${API_BASE_URL}/api/documents/${documentId}/download`;
 }
 
 // List all documents
@@ -249,6 +260,8 @@ export async function pollDocumentStatus(
   maxAttempts: number = 60  // Increased from 30 to 60, allowing for 120 seconds of polling
 ): Promise<DocumentResponse> {
   let attempts = 0;
+  let notFoundAttempts = 0; // Track "not found" errors separately
+  const MAX_NOT_FOUND_RETRIES = 15; // Increased from 10 to 15 to allow more time for document processing
   
   return new Promise<DocumentResponse>((resolve, reject) => {
     const checkStatus = async () => {
@@ -258,13 +271,18 @@ export async function pollDocumentStatus(
       }
       
       try {
+        console.log(`Checking status for document ${documentId} (attempt ${attempts+1}/${maxAttempts})`);
         const status = await getDocumentStatus(documentId);
+        // Reset not found counter on successful response
+        notFoundAttempts = 0;
         onStatusUpdate(status);
         
         if (status.status === "processed") {
+          console.log(`Document ${documentId} processing completed successfully`);
           resolve(status);
           return;
         } else if (status.status === "failed") {
+          console.error(`Document ${documentId} processing failed: ${status.error || "Unknown error"}`);
           reject(new Error(`Document processing failed: ${status.error || "Unknown error"}`));
           return;
         }
@@ -273,6 +291,28 @@ export async function pollDocumentStatus(
         attempts++;
         setTimeout(checkStatus, interval);
       } catch (error) {
+        // Special handling for "Document not found" errors
+        if (error instanceof Error && error.message.includes("Document not found")) {
+          notFoundAttempts++;
+          console.warn(`Document ${documentId} not found (attempt ${notFoundAttempts}/${MAX_NOT_FOUND_RETRIES}). This may be normal during processing.`);
+          
+          // Allow more retries for "not found" with progressively longer delays
+          if (notFoundAttempts < MAX_NOT_FOUND_RETRIES) {
+            // Use a progressively longer delay for not found errors
+            // Starting at 3 seconds and increasing with each attempt
+            const notFoundDelay = interval * 1.5 * notFoundAttempts;
+            console.log(`Retrying in ${notFoundDelay/1000} seconds...`);
+            attempts++;
+            setTimeout(checkStatus, notFoundDelay);
+            return;
+          } else {
+            console.error(`Document ${documentId} not found after ${MAX_NOT_FOUND_RETRIES} retries. The document may have failed to upload properly.`);
+          }
+        } else {
+          console.error(`Error checking document status: ${error instanceof Error ? error.message : "Unknown error"}`);
+        }
+        
+        // For other errors or if we've exceeded not found retries
         reject(error);
       }
     };
@@ -334,47 +374,94 @@ export async function sendChatMessageWithFile(
     formData.append("file", file);
   }
   
+  // Increased timeout for large files
+  const timeout = Math.max(60000, file.size / 10000); // 60s minimum, or longer for larger files
   const controller = new AbortController();
-  const timeoutId = setTimeout(() => controller.abort(), 60000); // 60 second timeout for uploads (increased from 30 seconds)
+  const timeoutId = setTimeout(() => controller.abort(), timeout);
+  
+  // Add retry logic for transient errors
+  const MAX_RETRIES = 2;
+  let retryCount = 0;
+  
+  const attemptUpload = async (): Promise<ChatResponse> => {
+    try {
+      console.log(`Sending chat message with file to ${API_BASE_URL}/api/chat/with-file`);
+      console.log(`File: ${file.name} (${file.size} bytes, ${file.type})`);
+      console.log(`Message: "${message.length > 50 ? message.substring(0, 50) + '...' : message}"`);
+      console.log(`Session ID: ${sessionId}`);
+      if (caseFileId) console.log(`Case File ID: ${caseFileId}`);
+      
+      const response = await fetch(`${API_BASE_URL}/api/chat/with-file`, {
+        method: 'POST',
+        body: formData,
+        signal: controller.signal,
+      });
+
+      if (!response.ok) {
+        const errorText = await response.text();
+        let errorMessage = `Upload error: ${response.status}`;
+        
+        try {
+          const errorJson = JSON.parse(errorText);
+          if (errorJson.detail) {
+            errorMessage = errorJson.detail;
+          }
+        } catch (e) {
+          if (errorText) {
+            errorMessage = errorText;
+          }
+        }
+        
+        console.error(`Error response from server: ${errorMessage}`);
+        
+        // Check for retriable errors (5xx server errors or specific error messages)
+        const isRetriable = 
+          (response.status >= 500 && response.status < 600) || 
+          errorMessage.includes("timeout") ||
+          errorMessage.includes("overloaded");
+        
+        if (isRetriable && retryCount < MAX_RETRIES) {
+          retryCount++;
+          console.warn(`Upload failed (${errorMessage}). Retrying (${retryCount}/${MAX_RETRIES})...`);
+          
+          // Add exponential backoff
+          const backoffMs = 1000 * Math.pow(2, retryCount);
+          await new Promise(resolve => setTimeout(resolve, backoffMs));
+          
+          return attemptUpload();
+        }
+        
+        throw new Error(errorMessage);
+      }
+
+      const responseData = await response.json();
+      console.log(`Successfully received response from server for file upload`);
+      return responseData;
+    } catch (error: any) {
+      if (error instanceof TypeError && error.message.includes("Failed to fetch")) {
+        if (retryCount < MAX_RETRIES) {
+          retryCount++;
+          console.warn(`Connection error. Retrying (${retryCount}/${MAX_RETRIES})...`);
+          
+          // Add exponential backoff
+          const backoffMs = 1000 * Math.pow(2, retryCount);
+          await new Promise(resolve => setTimeout(resolve, backoffMs));
+          
+          return attemptUpload();
+        }
+        throw new Error("Unable to connect to the API server. Please check if the server is running.");
+      }
+
+      if (error instanceof DOMException && error.name === "AbortError") {
+        throw new Error("Upload timed out. The file may be too large or the server is busy.");
+      }
+
+      throw error;
+    }
+  };
   
   try {
-    const response = await fetch(`${API_BASE_URL}/api/chat/with-file`, {
-      method: 'POST',
-      body: formData,
-      signal: controller.signal,
-    });
-
-    clearTimeout(timeoutId);
-
-    if (!response.ok) {
-      const errorText = await response.text();
-      let errorMessage = `Upload error: ${response.status}`;
-      
-      try {
-        const errorJson = JSON.parse(errorText);
-        if (errorJson.detail) {
-          errorMessage = errorJson.detail;
-        }
-      } catch (e) {
-        if (errorText) {
-          errorMessage = errorText;
-        }
-      }
-      
-      throw new Error(errorMessage);
-    }
-
-    return await response.json();
-  } catch (error) {
-    if (error instanceof TypeError && error.message.includes("Failed to fetch")) {
-      throw new Error("Unable to connect to the API server. Please check if the server is running.");
-    }
-
-    if (error instanceof DOMException && error.name === "AbortError") {
-      throw new Error("Upload timed out. The file may be too large or the server is busy.");
-    }
-
-    throw error;
+    return await attemptUpload();
   } finally {
     clearTimeout(timeoutId);
   }

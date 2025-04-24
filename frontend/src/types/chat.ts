@@ -7,4 +7,11 @@ export interface Message {
   sources?: Source[];
   nextQuestions?: string[];
   isError?: boolean;
+  fileAttachment?: {
+    name: string;
+    type: string;
+    isProcessing?: boolean;
+    documentId?: string;
+    error?: string;
+  };
 } 

@@ -55,6 +55,7 @@ class DocumentProcessor:
         self.vector_store = VectorStore()
         self.text_chunker = TextChunker(chunk_size=300, chunk_overlap=50, max_chunk_time=60)
         self.vision_service = VisionService()
+        self._initialized = False
         
         # Create a dedicated thread pool for CPU-bound tasks
         self.thread_pool = concurrent.futures.ThreadPoolExecutor(max_workers=4)
@@ -68,8 +69,21 @@ class DocumentProcessor:
         # Load document metadata from disk
         self._load_document_metadata()
         
-        # Sync document store with vector store
-        asyncio.create_task(self._sync_with_vector_store())
+        # Don't start the async task in __init__ - will be done in async_initialize
+        # This avoids the "no running event loop" error
+
+    async def async_initialize(self):
+        """Perform async initialization tasks. Call this method in an async context."""
+        if not self._initialized:
+            # Make sure document metadata is loaded
+            self._load_document_metadata()
+            
+            # Synchronize with vector store
+            await self._sync_with_vector_store()
+            
+            self._initialized = True
+            logger.info("✅ Document processor async initialization complete")
+        return self
         
     async def _sync_with_vector_store(self):
         """Synchronize the document store with the vector store to ensure consistency."""
@@ -141,34 +155,60 @@ class DocumentProcessor:
             logger.error(f"❌ ERROR SYNCING DOCUMENT STORE WITH VECTOR STORE: {str(e)}", exc_info=True)
             
     def _load_document_metadata(self):
-        """Load document metadata from disk."""
-        metadata_dir = Path("documents_metadata")
-        if not metadata_dir.exists():
-            return
+        """
+        Load document metadata from disk.
+        This ensures we maintain document information between restarts.
+        """
+        try:
+            metadata_dir = Path("documents_metadata")
+            if not metadata_dir.exists():
+                metadata_dir.mkdir(exist_ok=True)
+                logger.info("✅ Created documents_metadata directory")
+                return
             
-        logger.info("🔄 LOADING DOCUMENT METADATA FROM DISK")
-        count = 0
-        
-        for metadata_file in metadata_dir.glob("*.json"):
-            try:
-                with open(metadata_file, "r") as f:
-                    doc_data = json.load(f)
-                    
-                # Convert string dates back to datetime objects
-                if "created_at" in doc_data and doc_data["created_at"]:
-                    doc_data["created_at"] = datetime.fromisoformat(doc_data["created_at"])
-                if "processed_at" in doc_data and doc_data["processed_at"]:
-                    doc_data["processed_at"] = datetime.fromisoformat(doc_data["processed_at"])
-                    
-                # Create DocumentResponse object and add to document store
-                doc_response = DocumentResponse(**doc_data)
-                self.document_store[doc_response.document_id] = doc_response
-                count += 1
-            except Exception as e:
-                logger.error(f"❌ ERROR LOADING DOCUMENT METADATA: file={metadata_file}, error={str(e)}")
-                
-        logger.info(f"✅ LOADED {count} DOCUMENT METADATA RECORDS FROM DISK")
-        
+            loaded_count = 0
+            for metadata_file in metadata_dir.glob("*.json"):
+                try:
+                    with open(metadata_file, 'r') as f:
+                        document_id = metadata_file.stem
+                        metadata = json.load(f)
+                        
+                        # Convert ISO format strings back to datetime objects if needed
+                        created_at = datetime.now()
+                        processed_at = None
+                        
+                        if "created_at" in metadata and metadata["created_at"]:
+                            try:
+                                created_at = datetime.fromisoformat(metadata["created_at"])
+                            except:
+                                pass
+                        
+                        if "processed_at" in metadata and metadata["processed_at"]:
+                            try:
+                                processed_at = datetime.fromisoformat(metadata["processed_at"])
+                            except:
+                                pass
+                        
+                        # Recreate DocumentResponse object
+                        self.document_store[document_id] = DocumentResponse(
+                            document_id=document_id,
+                            filename=metadata.get("filename", "unknown.pdf"),
+                            session_id=metadata.get("session_id"),
+                            case_file_id=metadata.get("case_file_id"),
+                            status=metadata.get("status", "processed"),
+                            created_at=created_at,
+                            processed_at=processed_at,
+                            error=metadata.get("error"),
+                            is_global=metadata.get("is_global", False)
+                        )
+                        loaded_count += 1
+                except Exception as e:
+                    logger.error(f"❌ ERROR LOADING DOCUMENT METADATA: {metadata_file} - {str(e)}")
+            
+            logger.info(f"✅ LOADED {loaded_count} DOCUMENT METADATA RECORDS")
+        except Exception as e:
+            logger.error(f"❌ ERROR LOADING DOCUMENT METADATA: {str(e)}")
+
     def _save_document_metadata(self, document_id: str):
         """Save document metadata to disk."""
         document = self.document_store.get(document_id)

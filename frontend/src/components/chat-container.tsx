@@ -1,21 +1,26 @@
 "use client"
 
-import { useEffect, useRef, useState } from "react"
-import { ChatMessage } from "./chat-message"
-import { ChatInput } from "./chat-input"
-import { PromptSuggestions } from "./prompt-suggestions"
-import { FlipWords } from "./ui/flip-words"
+import type React from "react"
+import { useState, useEffect, useRef } from "react"
+import { useRouter, useSearchParams } from "next/navigation"
+import { useToast } from "@/components/ui/use-toast"
+import { ChatInput } from "@/components/chat-input"
+import { PromptSuggestions } from "@/components/prompt-suggestions"
+import { FlipWords } from "@/components/ui/flip-words"
 import { 
   sendChatMessage, 
   sendChatMessageWithFile, 
-  sendChatMessageWithDocumentText, 
-  uploadDocument,
-  type Source, 
-  checkApiHealth,
-  ChatResponse,
-  sendChatMessageWithImage
+  sendChatMessageWithImage,
+  sendChatMessageWithDocumentText,
+  createChatSession,
+  getChatSessions,
+  getChatHistory,
+  type ChatResponse,
+  type Source,
+  checkApiHealth
 } from "@/lib/api"
 import { Message } from "@/types/chat"
+import { ChatMessage } from "@/components/chat-message"
 // Import the ErrorMessage component
 import { ErrorMessage } from "./error-message"
 
@@ -38,22 +43,13 @@ interface ChatContainerProps {
 }
 
 export function ChatContainer({ sessionId: initialSessionId, caseFileId }: ChatContainerProps) {
-  const [messages, setMessages] = useState<
-    {
-      role: "user" | "assistant"
-      content: string
-      timestamp?: string
-      sources?: Source[]
-      nextQuestions?: string[]
-    }[]
-  >([])
-  const [isLoading, setIsLoading] = useState(false)
   const [sessionId, setSessionId] = useState<string | undefined>(initialSessionId)
+  const [messages, setMessages] = useState<Message[]>([])
+  const [isLoading, setIsLoading] = useState(false)
   const [showWelcome, setShowWelcome] = useState(true)
   const [apiConnected, setApiConnected] = useState<boolean | null>(null)
-  const messagesEndRef = useRef<HTMLDivElement>(null)
-  // Add a state for API connection errors
   const [apiError, setApiError] = useState<string | null>(null)
+  const messagesEndRef = useRef<HTMLDivElement>(null)
 
   // Complete phrases for the FlipWords component
   const legalPhrases = [
@@ -72,7 +68,6 @@ export function ChatContainer({ sessionId: initialSessionId, caseFileId }: ChatC
       } catch (error) {
         console.error("API health check failed:", error)
         setApiConnected(false)
-        setApiError("Unable to connect to the Legal AI Assistant API. Please ensure the API server is running.")
       }
     }
     
@@ -137,87 +132,230 @@ export function ChatContainer({ sessionId: initialSessionId, caseFileId }: ChatC
   const handleSendMessage = async (message: string, attachments: File[]) => {
     // Don't send if there's no message and no attachments
     if (!message && attachments.length === 0) return;
+    
+    // Clear any previous API errors
+    setApiError(null);
+    
+    // Add debugging for attachments
+    if (attachments.length > 0) {
+      console.log(`⬆️ handleSendMessage called with ${attachments.length} attachments:`, 
+        attachments.map(file => `${file.name} (${file.type}, ${file.size} bytes)`));
+    }
 
-    // Create a user message
+    // Create a user message with an attachment indicator if files are present
+    let userContent = message;
+    let fileAttachment = undefined;
+    
+    if (attachments.length > 0) {
+      const file = attachments[0]; // For now we only handle the first file
+      const fileNames = attachments.map(file => file.name).join(", ");
+      userContent = `${message}\n\n[Attaching: ${fileNames}]`;
+      
+      // Create file attachment info
+      fileAttachment = {
+        name: file.name,
+        type: file.type,
+        isProcessing: true,
+        documentId: 'pending' // Temporary ID that will be updated
+      };
+    }
+
     const userMessage: Message = {
       role: "user",
-      content: message,
+      content: userContent,
       timestamp: new Date().toISOString(),
+      fileAttachment
     };
 
     // Update state with user message
     setMessages((prev) => [...prev, userMessage]);
     setIsLoading(true);
+    setShowWelcome(false);
 
     try {
       let response: ChatResponse;
-
-      // Handle message with file attachments
-      if (attachments.length > 0) {
-        // For now we'll just use the first file
-        // In a more complete implementation, we might want to handle multiple files
-        const file = attachments[0];
-        
-        // Check if this is an image file
-        const isImage = file.type.startsWith('image/');
-        
-        if (isImage) {
-          // Use the vision API for image files
-          response = await sendChatMessageWithImage(
-            message,
-            file,
-            sessionId || "",
-            caseFileId
-          );
-        } else {
-          // Use regular file upload for non-image files
-          response = await sendChatMessageWithFile(
-            message,
-            file,
-            sessionId || "",
-            caseFileId
-          );
+      let retryCount = 0;
+      const MAX_RETRIES = 2;
+      
+      const attemptSendMessage = async (): Promise<ChatResponse> => {
+        try {
+          // Handle message with file attachments
+          if (attachments.length > 0) {
+            // For now we'll just use the first file
+            // In a more complete implementation, we might want to handle multiple files
+            const file = attachments[0];
+            console.log(`⚙️ Processing attachment: ${file.name} (${file.type}, ${file.size} bytes)`);
+            
+            // Update file status to uploading
+            setMessages((prev) => prev.map(msg => {
+              if (msg.role === 'user' && msg.fileAttachment && msg.fileAttachment.documentId === 'pending') {
+                return {
+                  ...msg,
+                  fileAttachment: {
+                    ...msg.fileAttachment,
+                    isProcessing: true
+                  }
+                };
+              }
+              return msg;
+            }));
+            
+            // Check if this is an image file
+            const isImage = file.type.startsWith('image/');
+            
+            if (isImage) {
+              console.log(`🖼️ Sending image through vision API: ${file.name}`);
+              // Use the vision API for image files
+              return await sendChatMessageWithImage(
+                message,
+                file,
+                sessionId || "",
+                caseFileId
+              );
+            } else {
+              console.log(`📄 Sending file through regular file API: ${file.name}`);
+              // Use regular file upload for non-image files
+              return await sendChatMessageWithFile(
+                message,
+                file,
+                sessionId || "",
+                caseFileId
+              );
+            }
+          } else {
+            console.log(`💬 Sending text-only message: "${message.length > 50 ? message.substring(0, 50) + '...' : message}"`);
+            // Handle text-only message
+            return await sendChatMessage(
+              message,
+              sessionId || "",
+              caseFileId
+            );
+          }
+        } catch (error: any) {
+          console.error("Error sending message:", error);
+          
+          // If sending failed, update the file attachment status
+          if (attachments.length > 0) {
+            setMessages((prev) => prev.map(msg => {
+              if (msg.role === 'user' && msg.fileAttachment && msg.fileAttachment.documentId === 'pending') {
+                return {
+                  ...msg,
+                  fileAttachment: {
+                    ...msg.fileAttachment,
+                    isProcessing: false,
+                    error: error.message || "Upload failed"
+                  }
+                };
+              }
+              return msg;
+            }));
+          }
+          
+          // Check if error is retriable
+          const isRetriable = 
+            error.message.includes("timeout") || 
+            error.message.includes("network") ||
+            error.message.includes("failed to fetch") ||
+            error.message.includes("aborted");
+          
+          if (isRetriable && retryCount < MAX_RETRIES) {
+            retryCount++;
+            console.warn(`Retrying message send (${retryCount}/${MAX_RETRIES})...`);
+            
+            // Add exponential backoff
+            const backoffMs = 1000 * Math.pow(2, retryCount);
+            await new Promise(resolve => setTimeout(resolve, backoffMs));
+            
+            return attemptSendMessage();
+          }
+          
+          throw error;
         }
-      } else {
-        // Handle text-only message
-        response = await sendChatMessage(
-          message,
-          sessionId || "",
-          caseFileId
-        );
-      }
-
-      // Update session ID if needed
+      };
+      
+      // Attempt to send the message
+      response = await attemptSendMessage();
+      
+      // If the message was sent successfully, update session ID if needed
       if (!sessionId && response.session_id) {
+        console.log(`🔄 Setting session ID: ${response.session_id}`);
         setSessionId(response.session_id);
       }
-
-      // Add assistant response
-      setMessages((prev) => [
-        ...prev,
-        {
-          role: "assistant",
-          content: response.message,
-          timestamp: new Date().toISOString(),
-          sources: response.sources || [],
-          nextQuestions: response.next_questions || [],
-        },
-      ]);
-    } catch (error) {
+      
+      // Check if we got a document ID back from the server for a file upload
+      if (attachments.length > 0 && response.uploaded_document_id) {
+        console.log(`📄 Got document ID from server: ${response.uploaded_document_id}`);
+        
+        // Find the user message we just added and update its file attachment with the actual document ID
+        setMessages(prev => prev.map(msg => {
+          if (msg.role === 'user' && msg.fileAttachment && msg.fileAttachment.documentId === 'pending') {
+            return {
+              ...msg,
+              fileAttachment: {
+                ...msg.fileAttachment,
+                documentId: response.uploaded_document_id,
+                isProcessing: false
+              }
+            };
+          }
+          return msg;
+        }));
+      }
+      
+      // Add the assistant's response
+      const assistantMessage: Message = {
+        role: "assistant",
+        content: response.message,
+        timestamp: new Date().toISOString(),
+        sources: response.sources,
+        nextQuestions: response.next_questions
+      };
+      
+      setMessages(prev => [...prev, assistantMessage]);
+      
+    } catch (error: any) {
       console.error("Error sending message:", error);
       
-      // Add error message
-      setMessages((prev) => [
-        ...prev,
-        {
-          role: "assistant",
-          content: error instanceof Error 
-            ? error.message 
-            : "An error occurred while processing your message.",
-          timestamp: new Date().toISOString(),
-          isError: true,
-        },
-      ]);
+      // Update file attachment status if there was an error
+      if (attachments.length > 0) {
+        setMessages((prev) => prev.map(msg => {
+          if (msg.role === 'user' && msg.fileAttachment && msg.fileAttachment.documentId === 'pending') {
+            return {
+              ...msg,
+              fileAttachment: {
+                ...msg.fileAttachment,
+                isProcessing: false,
+                error: error.message || "Upload failed"
+              }
+            };
+          }
+          return msg;
+        }));
+      }
+      
+      let errorMessage = "An error occurred while sending your message.";
+      
+      // Handle specific error cases
+      if (error.message.includes("timeout")) {
+        errorMessage = "The request timed out. The document may be too large or the server is busy.";
+      } else if (error.message.includes("Failed to fetch") || error.message.includes("network")) {
+        errorMessage = "Unable to connect to the API server. Please check your internet connection.";
+      } else if (error.message.includes("processing")) {
+        errorMessage = "Error processing the document. The file may be corrupted or in an unsupported format.";
+      } else if (error.message) {
+        errorMessage = error.message;
+      }
+      
+      // Add an error message from the assistant
+      const errorAssistantMessage: Message = {
+        role: "assistant",
+        content: `I'm sorry, I encountered an error: ${errorMessage}`,
+        timestamp: new Date().toISOString(),
+        isError: true
+      };
+      
+      setMessages(prev => [...prev, errorAssistantMessage]);
+      setApiError(errorMessage);
     } finally {
       setIsLoading(false);
     }
@@ -284,6 +422,7 @@ export function ChatContainer({ sessionId: initialSessionId, caseFileId }: ChatC
                 sources={message.sources}
                 nextQuestions={message.nextQuestions}
                 onFollowUpClick={handleFollowUpQuestion}
+                fileAttachment={message.fileAttachment}
               />
             ))}
             {isLoading && (
